@@ -18,17 +18,17 @@ PKG_BUILD_DEPENDS:=uhttpd
 
 include $(INCLUDE_DIR)/package.mk
 
-define Package/uhttpd-mod-ws
+define Package/$(PKG_NAME)
   SECTION:=net
   CATEGORY:=Network
   SUBMENU:=Web Servers/Proxies
-  TITLE:=WebSocket transport for ubus JSON-RPC
+  TITLE:=WebSocket transport for ubus JSON RPC
   URL:=https://github.com/zerogiven/owrt-uhttpd-mod-ws
   DEPENDS:=uhttpd +libubus +libubox +libblobmsg-json +libjson-c +libwebsockets-openssl||libwebsockets-mbedtls
 endef
 
-define Package/uhttpd-mod-ws/description
-  WebSocket transport plugin for uhttpd ubus JSON-RPC.
+define Package/$(PKG_NAME)/description
+  WebSocket transport plugin for uhttpd ubus JSON RPC.
 endef
 
 # define Build/Prepare
@@ -45,18 +45,10 @@ define Build/Compile
 		LDFLAGS="$(TARGET_LDFLAGS) -L$(STAGING_DIR)/usr/lib"
 endef
 
-define Package/uhttpd-mod-ws/install
-	$(INSTALL_DIR) $(1)/usr/lib/uhttpd
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/uhttpd_ws.so $(1)/usr/lib/uhttpd/uhttpd_ws.so
-
-	# Bundled LuCI client (rpc-ws.js) and any other staged resources.
-	# files/<path-on-device> -> $(1)/<path-on-device>.
-	# Mirrors LuCI's resource convention so 'require rpc-ws' resolves
-	# at /www/luci-static/resources/rpc-ws.js as soon as LuCI is present.
-	# No hard luci-base dep -- the file is harmless without LuCI; useful
-	# the moment LuCI is installed alongside.
-	$(INSTALL_DIR) $(1)/www/luci-static/resources
-	$(CP) ./files/www/luci-static/resources/rpc-ws.js $(1)//www/luci-static/resources/
+define Package/$(PKG_NAME)/install
+	$(INSTALL_DIR) $(1)/usr/lib/uhttpd $(1)/www/luci-static/resources
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/uhttpd_ws.so $(1)/usr/lib/
+	$(INSTALL_DATA) ./files/www/luci-static/resources/rpc-ws.js $(1)//www/luci-static/resources/rpc-ws.js
 endef
 
 $(eval $(call BuildPackage,uhttpd-mod-ws))
