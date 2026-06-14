@@ -153,10 +153,15 @@ static void  ws_conn_teardown(struct ws_conn *c);
 static const char *
 get_header(struct client *cl, const char *name)
 {
-    int i;
-    for (i = 0; i < cl->request.n_headers; i++)
-        if (!strcasecmp(cl->request.headers[i].name, name))
-            return cl->request.headers[i].value;
+    struct blob_attr *cur;
+    int rem;
+
+    /* uhttpd stores parsed request headers in cl->hdr as a blobmsg. Names
+     * are lowercased on the way in; iterate case-insensitively so callers
+     * can pass the canonical mixed-case form they wrote in the spec. */
+    blob_for_each_attr(cur, cl->hdr.head, rem)
+        if (!strcasecmp(blobmsg_name(cur), name))
+            return blobmsg_get_string(cur);
     return NULL;
 }
 
@@ -295,31 +300,27 @@ ws_origin_ok(struct client *cl)
 
 /* ---- request reconstruction for lws_adopt_socket_readbuf -------------- *
  *
- * uhttpd has already parsed the HTTP upgrade request and split headers
- * into cl->request.headers. libwehsockets needs to see the raw request
- * bytes to drive its own state machine (handshake + 101 response).
+ * uhttpd has already parsed the HTTP upgrade request: headers live in
+ * cl->hdr (blobmsg, lowercased names), and the URL came in as the `url`
+ * parameter to our handle_request callback. Rebuild the raw HTTP request
+ * bytes so libwebsockets can drive its own handshake state machine.
  *
- * We rebuild from cl. The lws_adopt_socket_readbuf readbuf is capped at
- * 2048 bytes (the ah rx buf size); a typical browser upgrade request is
- * 300-800 bytes so this fits comfortably.
- *
- * TODO(verify on-device): the field name for the request URL in
- * cl->request might be different (cl->request.url vs cl->request.uri).
- * Adjust per the actual uhttpd plugin.h.
+ * lws_adopt_socket_readbuf caps the readbuf at 2048 bytes (the ah rx buf);
+ * a typical browser WS upgrade is 300-800 bytes so this fits comfortably.
  */
 static int
-ws_rebuild_request(struct client *cl, char *buf, size_t buflen)
+ws_rebuild_request(struct client *cl, const char *url, char *buf, size_t buflen)
 {
-    int total, n, i;
+    int total, n, rem;
+    struct blob_attr *cur;
 
-    n = snprintf(buf, buflen, "GET %s HTTP/1.1\r\n",
-                 cl->request.url ? cl->request.url : "/");
+    n = snprintf(buf, buflen, "GET %s HTTP/1.1\r\n", url ? url : "/");
     if (n < 0 || (size_t)n >= buflen) return -1;
     total = n;
 
-    for (i = 0; i < cl->request.n_headers; i++) {
-        const char *hn = cl->request.headers[i].name;
-        const char *hv = cl->request.headers[i].value;
+    blob_for_each_attr(cur, cl->hdr.head, rem) {
+        const char *hn = blobmsg_name(cur);
+        const char *hv = blobmsg_get_string(cur);
         n = snprintf(buf + total, buflen - total, "%s: %s\r\n", hn, hv);
         if (n < 0 || (size_t)(total + n) >= buflen) return -1;
         total += n;
@@ -745,7 +746,7 @@ ws_handle_request(struct client *cl, char *url, struct path_info *pi)
     char *pending_sid;
     struct lws *wsi;
 
-    (void)url; (void)pi;
+    (void)pi;
 
     /* CSWSH defense */
     if (!ws_origin_ok(cl)) {
@@ -768,7 +769,7 @@ ws_handle_request(struct client *cl, char *url, struct path_info *pi)
 
     /* Rebuild the HTTP request bytes so libwebsockets can do the
      * upgrade handshake itself. */
-    rlen = ws_rebuild_request(cl, reqbuf, sizeof(reqbuf));
+    rlen = ws_rebuild_request(cl, url, reqbuf, sizeof(reqbuf));
     if (rlen < 0) {
         ops->client_error(cl, 400, "Bad Request", "Upgrade request too large");
         return;
@@ -777,7 +778,7 @@ ws_handle_request(struct client *cl, char *url, struct path_info *pi)
     /* dup the socket fd so libwebsockets gets an independent reference.
      * uhttpd will close its original fd via client_close below; the
      * kernel TCP connection survives because lws holds the dup. */
-    fd = dup(cl->fd.fd);
+    fd = dup(cl->sfd.fd);
     if (fd < 0) {
         ops->client_error(cl, 500, "Internal Error", "dup() failed");
         return;

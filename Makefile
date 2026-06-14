@@ -24,34 +24,18 @@ define Package/$(PKG_NAME)
   SUBMENU:=Web Servers/Proxies
   TITLE:=WebSocket transport for ubus JSON RPC
   URL:=https://github.com/zerogiven/owrt-uhttpd-mod-ws
-  DEPENDS:=uhttpd +libubus +libubox +libblobmsg-json +libjson-c +libwebsockets
+  DEPENDS:=uhttpd +libubus +libubox +libblobmsg-json +libjson-c +libwebsockets +libustream-ssl
 endef
 
 define Package/$(PKG_NAME)/description
   WebSocket transport plugin for uhttpd ubus JSON RPC.
 endef
 
-define Build/Prepare
-	mkdir -p $(PKG_BUILD_DIR)
-	$(CP) ./src/* $(PKG_BUILD_DIR)/
-	@echo '=== DEBUG Build/Prepare: locate uhttpd headers ============'
-	@echo '--- BUILD_DIR = $(BUILD_DIR)'
-	@ls -1 $(BUILD_DIR) 2>/dev/null | head -40 || echo '(BUILD_DIR empty or missing)'
-	@echo '--- uhttpd-* dirs in BUILD_DIR:'
-	@ls -1d $(BUILD_DIR)/uhttpd-* 2>/dev/null || echo '(none)'
-	@echo '--- STAGING_DIR = $(STAGING_DIR)'
-	@find $(STAGING_DIR) -name 'uhttpd.h' -o -name 'plugin.h' 2>/dev/null || echo '(no uhttpd headers in staging)'
-	@echo '--- anywhere reachable under BUILD_DIR (depth 5):'
-	@find $(BUILD_DIR) -maxdepth 5 -name 'uhttpd.h' -o -name 'plugin.h' 2>/dev/null || echo '(none in BUILD_DIR either)'
-	@echo '=== END DEBUG Build/Prepare ================================'
-	$(CP) $(BUILD_DIR)/uhttpd-*/uhttpd.h $(PKG_BUILD_DIR)/
-	$(CP) $(BUILD_DIR)/uhttpd-*/plugin.h $(PKG_BUILD_DIR)/
-endef
-
 define Build/Compile
 	$(MAKE) -C $(PKG_BUILD_DIR) \
 		CC="$(TARGET_CC)" \
 		CFLAGS="$(TARGET_CFLAGS) -I$(STAGING_DIR)/usr/include \
+			-DHAVE_TLS \
 			-D_GNU_SOURCE -Wall -Wextra -Os" \
 		LDFLAGS="$(TARGET_LDFLAGS) -L$(STAGING_DIR)/usr/lib"
 endef
