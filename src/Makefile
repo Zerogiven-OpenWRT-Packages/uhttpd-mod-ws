@@ -13,7 +13,10 @@ SO   = uhttpd_ws.so
 LIBS = -lubus -lubox -lblobmsg_json -ljson-c -lwebsockets
 
 CFLAGS  ?= -Wall -Wextra -Os
-CFLAGS  += -fPIC -std=gnu99 -fvisibility=hidden
+# These three are build-essential and must survive even when the outer
+# OpenWrt Makefile passes CFLAGS as a command-line override (which would
+# otherwise win over a plain `+=`). 'override' forces the addition.
+override CFLAGS += -fPIC -std=gnu99 -fvisibility=hidden
 LDFLAGS ?=
 
 all: $(SO)
