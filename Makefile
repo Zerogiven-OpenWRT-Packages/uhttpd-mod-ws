@@ -22,13 +22,13 @@ define Package/uhttpd-mod-ws
   SECTION:=net
   CATEGORY:=Network
   SUBMENU:=Web Servers/Proxies
-  TITLE:=WebSocket (RFC 6455) transport for ubus JSON-RPC
+  TITLE:=WebSocket transport for ubus JSON-RPC
   URL:=https://github.com/zerogiven/owrt-uhttpd-mod-ws
   DEPENDS:=uhttpd +libubus +libubox +libblobmsg-json +libjson-c +libwebsockets-openssl||libwebsockets-mbedtls
 endef
 
 define Package/uhttpd-mod-ws/description
-	WebSocket transport plugin for uhttpd ubus JSON-RPC.
+  WebSocket transport plugin for uhttpd ubus JSON-RPC.
 endef
 
 # define Build/Prepare
@@ -47,8 +47,7 @@ endef
 
 define Package/uhttpd-mod-ws/install
 	$(INSTALL_DIR) $(1)/usr/lib/uhttpd
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/uhttpd_ws.so \
-		$(1)/usr/lib/uhttpd/uhttpd_ws.so
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/uhttpd_ws.so $(1)/usr/lib/uhttpd/uhttpd_ws.so
 
 	# Bundled LuCI client (rpc-ws.js) and any other staged resources.
 	# files/<path-on-device> -> $(1)/<path-on-device>.
@@ -56,8 +55,8 @@ define Package/uhttpd-mod-ws/install
 	# at /www/luci-static/resources/rpc-ws.js as soon as LuCI is present.
 	# No hard luci-base dep -- the file is harmless without LuCI; useful
 	# the moment LuCI is installed alongside.
-	$(INSTALL_DIR) $(1)
-	$(CP) ./files/. $(1)/
+	$(INSTALL_DIR) $(1)/www/luci-static/resources
+	$(CP) ./files/www/luci-static/resources/rpc-ws.js $(1)//www/luci-static/resources/
 endef
 
 $(eval $(call BuildPackage,uhttpd-mod-ws))
