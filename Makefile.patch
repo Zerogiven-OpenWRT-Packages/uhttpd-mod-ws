@@ -1,0 +1,64 @@
+# Patch against openwrt/openwrt: package/network/services/uhttpd/Makefile
+# Mirrors the existing mod-ubus stanza; adjust path/version offsets to match
+# the current Makefile when you actually apply.
+#
+# Two additions:
+#   1) A Package/uhttpd-mod-ws stanza declaring the sub-package
+#   2) An ws.so build rule
+#
+# Drop ws.c + sha1.c (steve reid's PD impl) into src/ alongside ubus.c.
+
+--- a/package/network/services/uhttpd/Makefile
++++ b/package/network/services/uhttpd/Makefile
+@@ -XX,X +XX,X @@ define Package/uhttpd-mod-ubus
+   TITLE:=ubus via JSON-RPC integration
+ endef
+
++define Package/uhttpd-mod-ws
++$(call Package/uhttpd/template)
++  DEPENDS:=uhttpd +libubus +libblobmsg-json +libjson-c
++  TITLE:=WebSocket (RFC 6455) transport for ubus JSON-RPC
++endef
++
++define Package/uhttpd-mod-ws/description
++ Provides /ubus/ws -- a WebSocket endpoint speaking the same JSON-RPC
++ dialect as /ubus, with added subscribe/unsubscribe verbs for one-way
++ server-to-client streaming. Authenticated via Authorization: Bearer
++ <session_id>. Multiplexes N calls + M subscriptions per connection.
++endef
++
+ define Build/Configure
+ ...
+
+@@ -XX,X +XX,X @@ define Build/Compile
+ 	$(MAKE) -C $(PKG_BUILD_DIR) plugin_ubus
++	$(MAKE) -C $(PKG_BUILD_DIR) plugin_ws
+ endef
+
+@@ -XX,X +XX,X @@ define Package/uhttpd-mod-ubus/install
+ 	$(INSTALL_DIR) $(1)/usr/lib/uhttpd
+ 	$(CP) $(PKG_BUILD_DIR)/uhttpd_ubus.so $(1)/usr/lib/uhttpd/
+ endef
+
++define Package/uhttpd-mod-ws/install
++	$(INSTALL_DIR) $(1)/usr/lib/uhttpd
++	$(CP) $(PKG_BUILD_DIR)/uhttpd_ws.so $(1)/usr/lib/uhttpd/
++endef
++
+ $(eval $(call BuildPackage,uhttpd))
+ $(eval $(call BuildPackage,uhttpd-mod-ubus))
++$(eval $(call BuildPackage,uhttpd-mod-ws))
+
+
+# And in src/Makefile (or wherever plugin targets live):
+
+--- a/package/network/services/uhttpd/src/Makefile
++++ b/package/network/services/uhttpd/src/Makefile
+@@
+ plugin_ubus: uhttpd_ubus.so
+ uhttpd_ubus.so: ubus.o
+ 	$(CC) $(LDFLAGS) -shared -o $@ $^ -lubus -lblobmsg_json
+
++plugin_ws: uhttpd_ws.so
++uhttpd_ws.so: ws.o sha1.o
++	$(CC) $(LDFLAGS) -shared -o $@ $^ -lubus -lblobmsg_json -ljson-c
