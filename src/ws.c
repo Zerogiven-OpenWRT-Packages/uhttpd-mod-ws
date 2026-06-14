@@ -235,6 +235,8 @@ ws_acl_reply_cb(struct ubus_request *r, int type, struct blob_attr *msg)
     struct blob_attr *cur;
     int rem;
 
+    (void)type;
+
     blob_for_each_attr(cur, msg, rem)
         if (blobmsg_type(cur) == BLOBMSG_TYPE_BOOL &&
             !strcmp(blobmsg_name(cur), "access"))
@@ -393,6 +395,9 @@ ws_call_reply_cb(struct ubus_request *r, int type, struct blob_attr *msg)
 {
     struct json_object **out = r->priv;
     char *s = blobmsg_format_json(msg, true);
+
+    (void)type;
+
     *out = s ? json_tokener_parse(s) : NULL;
     free(s);
 }
@@ -591,6 +596,8 @@ ws_notify_cb(struct ubus_context *ctx, struct ubus_object *obj,
     struct json_object *frame, *params, *data;
     char *blob_json;
 
+    (void)ctx; (void)req;
+
     frame  = json_object_new_object();
     params = json_object_new_array();
     json_object_array_add(params, json_object_new_string(s->path));
@@ -732,7 +739,7 @@ static const struct lws_protocols ws_protocols[] = {
         .per_session_data_size = sizeof(struct ws_conn),
         .rx_buffer_size        = WS_MAX_FRAME,
     },
-    { NULL, NULL, 0, 0 }    /* terminator */
+    { NULL, NULL, 0, 0, 0, NULL, 0 }    /* terminator */
 };
 
 /* ---- uhttpd dispatch entry -------------------------------------------- */
@@ -778,7 +785,9 @@ ws_handle_request(struct client *cl, char *url, struct path_info *pi)
     /* dup the socket fd so libwebsockets gets an independent reference.
      * uhttpd will close its original fd via client_close below; the
      * kernel TCP connection survives because lws holds the dup. */
-    fd = dup(cl->sfd.fd);
+    /* cl->sfd is struct ustream_fd, which wraps a struct uloop_fd; the
+     * actual int file descriptor sits one level deeper. */
+    fd = dup(cl->sfd.fd.fd);
     if (fd < 0) {
         ops->client_error(cl, 500, "Internal Error", "dup() failed");
         return;
@@ -804,9 +813,10 @@ ws_handle_request(struct client *cl, char *url, struct path_info *pi)
     }
     lws_set_opaque_user_data(wsi, pending_sid);
 
-    /* Tell uhttpd we're done with this client. uhttpd closes its fd; lws
-     * keeps the dup. The dispatch handler returns and uhttpd reclaims cl. */
-    ops->client_close(cl);
+    /* Tell uhttpd we're done with this client. uhttpd's plugin vtable
+     * doesn't expose a "close socket" op; the right signal is
+     * request_done() which tears down the cl. Our dup'd fd survives. */
+    ops->request_done(cl);
 }
 
 /* ---- plugin registration ---------------------------------------------- */
@@ -837,7 +847,7 @@ ws_lws_init(void)
     info.gid               = -1;
     info.uid               = -1;
     info.options           = LWS_SERVER_OPTION_VALIDATE_UTF8 |
-                             LWS_SERVER_OPTION_DISABLE_IPV6_LISTEN;
+                             LWS_SERVER_OPTION_DISABLE_IPV6;
     /*
      * TODO(verify on-device): the OpenWrt libwebsockets build is compiled
      * with LWS_WITH_ULOOP=ON. The expected pattern for sharing uhttpd's
