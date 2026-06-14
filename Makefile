@@ -14,6 +14,8 @@ PKG_LICENSE_FILES:=LICENSE
 
 PKG_BUILD_PARALLEL:=1
 
+PKG_BUILD_DEPENDS:=uhttpd
+
 include $(INCLUDE_DIR)/package.mk
 
 define Package/uhttpd-mod-ws
@@ -22,23 +24,17 @@ define Package/uhttpd-mod-ws
   SUBMENU:=Web Servers/Proxies
   TITLE:=WebSocket (RFC 6455) transport for ubus JSON-RPC
   URL:=https://github.com/zerogiven/owrt-uhttpd-mod-ws
-  DEPENDS:=uhttpd +libubus +libubox +libblobmsg-json +libjson-c \
-           +libwebsockets-openssl||libwebsockets-mbedtls
+  DEPENDS:=uhttpd +libubus +libubox +libblobmsg-json +libjson-c +libwebsockets-openssl||libwebsockets-mbedtls
 endef
 
 define Package/uhttpd-mod-ws/description
- RFC 6455 WebSocket transport plugin for uhttpd. Adds an endpoint
- derived from option ubus_prefix - default /ubus-ws - speaking the
- same JSON-RPC 2.0 dialect as uhttpd-mod-ubus plus subscribe and
- unsubscribe verbs for server-to-client push. One WS connection
- multiplexes calls and subscriptions. Authentication via the rpcd
- session object - same ACL gate as uhttpd-mod-ubus uses.
+	WebSocket transport plugin for uhttpd ubus JSON-RPC.
 endef
 
-define Build/Prepare
-	mkdir -p $(PKG_BUILD_DIR)
-	$(CP) ./src/* $(PKG_BUILD_DIR)/
-endef
+# define Build/Prepare
+# 	mkdir -p $(PKG_BUILD_DIR)
+# 	$(CP) ./src/* $(PKG_BUILD_DIR)/
+# endef
 
 define Build/Compile
 	$(MAKE) -C $(PKG_BUILD_DIR) \

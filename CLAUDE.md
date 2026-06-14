@@ -149,7 +149,6 @@ Mechanical to resolve once a build is running on a device:
 ## What this repo does NOT contain
 
 - A reference producer daemon (`publish()` + `subscribe_cb` lifecycle) — that pattern is per-app and lives wherever the consuming app lives. See `applications/luci-app-example/` in openwrt/luci for a small reference.
-- A `LICENSE` file — Apache-2.0 is declared in `Makefile` (`PKG_LICENSE`). Drop in a `LICENSE` file before publishing.
 - A hard `luci-base` dependency — the package installs `rpc-ws.js` into `/www/luci-static/resources/` regardless. Harmless when LuCI isn't installed; immediately useful when it is. If you want to force LuCI as a prerequisite, add `+luci-base` to `DEPENDS`.
 
 ## Commit conventions
