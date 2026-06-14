@@ -35,6 +35,7 @@ define Build/Compile
 	$(MAKE) -C $(PKG_BUILD_DIR) \
 		CC="$(TARGET_CC)" \
 		CFLAGS="$(TARGET_CFLAGS) -I$(STAGING_DIR)/usr/include \
+			-fPIC -std=gnu99 -fvisibility=hidden \
 			-DHAVE_TLS \
 			-D_GNU_SOURCE -Wall -Wextra -Os" \
 		LDFLAGS="$(TARGET_LDFLAGS) -L$(STAGING_DIR)/usr/lib"
