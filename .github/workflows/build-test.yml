@@ -1,0 +1,51 @@
+name: Build OpenWRT package (test)
+
+on:
+  workflow_dispatch:
+    inputs:
+      openwrt_version:
+        description: 'OpenWrt version to test'
+        required: true
+        default: '25.12'
+        type: choice
+        options:
+        - '25.12'
+        - '24.10'
+        - 'all'
+      verbose:
+        description: 'Verbose build output'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  build-test:
+    name: Build Test - OpenWrt ${{ matrix.openwrt_version }}
+    strategy:
+      matrix:
+        include:
+          - openwrt_version: '25.12'
+            openwrt_build_version: '25.12.4'
+            arch: 'x86_64'
+          - openwrt_version: '24.10'
+            openwrt_build_version: '24.10.7'
+            arch: 'x86_64'
+      fail-fast: false
+
+    permissions: {}
+    uses: Zerogiven/gh-openwrt-package-build-workflows/.github/workflows/reusable-build.yml@main
+    with:
+      package_name: 'uhttpd-mod-ws'
+      sdk_packages: 'uhttpd-mod-ws'
+      artifacts_patterns: |
+        uhttpd-mod-ws*.ipk
+        uhttpd-mod-ws*.apk
+      openwrt_version: ${{ matrix.openwrt_version }}
+      openwrt_build_version: ${{ matrix.openwrt_build_version }}
+      arch: ${{ matrix.arch }}
+      selected_version: ${{ github.event.inputs.openwrt_version }}
+      free_disk_space: false
+      use_patched_build: false
+      verbose: ${{ github.event.inputs.verbose == 'true' }}
+    secrets:
+      APK_SIGN_KEY: ${{ secrets.APK_SIGN_KEY }}
