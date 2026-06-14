@@ -57,7 +57,7 @@ V1 leaves this as a known build prerequisite; pick the path that fits the distri
 - `libubus` (RPC to ubusd)
 - `libubox` (uloop, blobmsg, avl, list)
 - `libblobmsg-json`, `libjson-c` (JSON ↔ blob translation)
-- `libwebsockets` (RFC 6455 framing + handshake; **any** of `libwebsockets-openssl`, `libwebsockets-mbedtls`, `libwebsockets-full` works — the Makefile DEPENDS expresses the OR-condition)
+- `libwebsockets` (RFC 6455 framing + handshake). DEPENDS uses the virtual `libwebsockets` name; satisfied by **`libwebsockets-mbedtls`** (PROVIDES `libwebsockets`) or **`libwebsockets-full`** (PROVIDES `libwebsockets`). The standalone `libwebsockets-openssl` variant does NOT provide the virtual name — users wanting an openssl backend should install `libwebsockets-full` instead.
 - `rpcd` (provides the `session` ubus object — auth + ACL gating)
 
 ## Critical design constraints
