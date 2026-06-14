@@ -42,14 +42,21 @@ make package/uhttpd-mod-ws/compile V=s
 
 There is no host-side build, no test suite, and no `make check`. Verification is reading + on-device testing.
 
-### Header dependency caveat
+### How we find uhttpd's plugin headers
 
-uhttpd does **not** currently install its plugin headers (`uhttpd.h`, `plugin.h`) to `$(STAGING_DIR)/usr/include/uhttpd/`. The package Makefile assumes those headers are there (`-I$(STAGING_DIR)/usr/include/uhttpd`). Without them the build will fail at compile time. Two ways out:
+uhttpd's package has no `Build/InstallDev` recipe — its plugin headers (`uhttpd.h`, `plugin.h`) are **not** installed to `$(STAGING_DIR)`. But `PKG_BUILD_DEPENDS:=uhttpd` guarantees uhttpd's source tree is unpacked to `$(BUILD_DIR)/uhttpd-<version>/` before our compile starts, and those headers live at the root of that source tree.
 
-1. **Patch uhttpd** to add a `Build/InstallDev` recipe that installs the headers (clean upstream fix; small PR to openwrt/openwrt). This is the path-of-least-drift.
-2. **Bundle copies of `uhttpd.h` + `plugin.h`** into `src/` from a known uhttpd commit and drop the `-I$(STAGING_DIR)/usr/include/uhttpd` flag. Pragmatic but pins us to one uhttpd plugin-ABI revision.
+The Makefile resolves the versioned directory at use-time via:
 
-V1 leaves this as a known build prerequisite; pick the path that fits the distribution model.
+```makefile
+UHTTPD_SRC_DIR = $(firstword $(filter-out $(PKG_BUILD_DIR),$(wildcard $(BUILD_DIR)/uhttpd-*)))
+```
+
+Two things to note:
+- **Deferred `=`** (not `:=`) so the wildcard expands when `Build/Compile` runs, not at parse time when the dir doesn't exist yet.
+- **`filter-out $(PKG_BUILD_DIR)`** because our own `uhttpd-mod-ws-<ver>` dir matches `uhttpd-*` too — without the filter, the wildcard could pick our directory and produce a confusing build failure.
+
+The clean long-term fix would be a small upstream PR adding `Build/InstallDev` to openwrt's uhttpd Makefile (installs `uhttpd.h` + `plugin.h` to `$(STAGING_DIR)/usr/include/uhttpd/`). That would benefit any future plugin author too. Until then, the wildcard pattern is the standard workaround for feed packages consuming headers from a non-Dev-installing dep.
 
 ## Required dependencies (runtime)
 
