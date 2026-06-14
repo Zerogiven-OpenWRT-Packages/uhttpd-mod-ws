@@ -31,23 +31,22 @@ define Package/$(PKG_NAME)/description
   WebSocket transport plugin for uhttpd ubus JSON RPC.
 endef
 
-# define Build/Prepare
-# 	mkdir -p $(PKG_BUILD_DIR)
-# 	$(CP) ./src/* $(PKG_BUILD_DIR)/
-# endef
-
-# uhttpd does not install its plugin headers (uhttpd.h, plugin.h) to
-# STAGING_DIR -- it has no Build/InstallDev. But PKG_BUILD_DEPENDS:=uhttpd
-# guarantees its source tree is unpacked at $(BUILD_DIR)/uhttpd-<ver> by
-# the time we compile. Resolve the versioned dir at use-time (deferred '=')
-# and filter out our own dir which would also match the uhttpd-* glob.
-UHTTPD_SRC_DIR = $(firstword $(filter-out $(PKG_BUILD_DIR),$(wildcard $(BUILD_DIR)/uhttpd-*)))
+define Build/Prepare
+	mkdir -p $(PKG_BUILD_DIR)
+	$(CP) ./src/* $(PKG_BUILD_DIR)/
+	# uhttpd has no Build/InstallDev, so its plugin headers never land
+	# in STAGING_DIR. PKG_BUILD_DEPENDS:=uhttpd guarantees its source is
+	# already unpacked at $(BUILD_DIR)/uhttpd-<version>/ by now -- copy
+	# the two headers we need alongside our source so the existing
+	# #include "uhttpd.h" and "plugin.h" resolve as siblings.
+	$(CP) $(BUILD_DIR)/uhttpd-*/uhttpd.h $(PKG_BUILD_DIR)/
+	$(CP) $(BUILD_DIR)/uhttpd-*/plugin.h $(PKG_BUILD_DIR)/
+endef
 
 define Build/Compile
 	$(MAKE) -C $(PKG_BUILD_DIR) \
 		CC="$(TARGET_CC)" \
 		CFLAGS="$(TARGET_CFLAGS) -I$(STAGING_DIR)/usr/include \
-			-I$(UHTTPD_SRC_DIR) \
 			-D_GNU_SOURCE -Wall -Wextra -Os" \
 		LDFLAGS="$(TARGET_LDFLAGS) -L$(STAGING_DIR)/usr/lib"
 endef
