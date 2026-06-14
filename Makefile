@@ -27,20 +27,12 @@ define Package/uhttpd-mod-ws
 endef
 
 define Package/uhttpd-mod-ws/description
-  Adds the endpoint /<ubus_prefix>-ws (default /ubus-ws) to uhttpd,
-  speaking the same JSON-RPC 2.0 dialect as /<ubus_prefix> plus
-  subscribe/unsubscribe verbs for server-to-client push (live logs,
-  stats, events). One WS connection multiplexes many calls and many
-  subscriptions.
-
-  Sibling of uhttpd-mod-ubus; both can be installed concurrently.
-  Auth: Sec-WebSocket-Protocol bearer (primary, browser-compatible) or
-  Authorization: Bearer (fallback for non-browser clients). ACL via
-  rpcd session.access -- same gate as mod-ubus uses.
-
-  Requires uhttpd plugin headers (uhttpd.h, plugin.h) at build time.
-  See CLAUDE.md for the dependency situation if you are bootstrapping
-  this package outside the uhttpd source tree.
+ RFC 6455 WebSocket transport plugin for uhttpd. Adds an endpoint
+ derived from option ubus_prefix - default /ubus-ws - speaking the
+ same JSON-RPC 2.0 dialect as uhttpd-mod-ubus plus subscribe and
+ unsubscribe verbs for server-to-client push. One WS connection
+ multiplexes calls and subscriptions. Authentication via the rpcd
+ session object - same ACL gate as uhttpd-mod-ubus uses.
 endef
 
 define Build/Prepare
