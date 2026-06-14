@@ -34,11 +34,16 @@ endef
 define Build/Prepare
 	mkdir -p $(PKG_BUILD_DIR)
 	$(CP) ./src/* $(PKG_BUILD_DIR)/
-	# uhttpd has no Build/InstallDev, so its plugin headers never land
-	# in STAGING_DIR. PKG_BUILD_DEPENDS:=uhttpd guarantees its source is
-	# already unpacked at $(BUILD_DIR)/uhttpd-<version>/ by now -- copy
-	# the two headers we need alongside our source so the existing
-	# #include "uhttpd.h" and "plugin.h" resolve as siblings.
+	@echo '=== DEBUG Build/Prepare: locate uhttpd headers ============'
+	@echo '--- BUILD_DIR = $(BUILD_DIR)'
+	@ls -1 $(BUILD_DIR) 2>/dev/null | head -40 || echo '(BUILD_DIR empty or missing)'
+	@echo '--- uhttpd-* dirs in BUILD_DIR:'
+	@ls -1d $(BUILD_DIR)/uhttpd-* 2>/dev/null || echo '(none)'
+	@echo '--- STAGING_DIR = $(STAGING_DIR)'
+	@find $(STAGING_DIR) -name 'uhttpd.h' -o -name 'plugin.h' 2>/dev/null || echo '(no uhttpd headers in staging)'
+	@echo '--- anywhere reachable under BUILD_DIR (depth 5):'
+	@find $(BUILD_DIR) -maxdepth 5 -name 'uhttpd.h' -o -name 'plugin.h' 2>/dev/null || echo '(none in BUILD_DIR either)'
+	@echo '=== END DEBUG Build/Prepare ================================'
 	$(CP) $(BUILD_DIR)/uhttpd-*/uhttpd.h $(PKG_BUILD_DIR)/
 	$(CP) $(BUILD_DIR)/uhttpd-*/plugin.h $(PKG_BUILD_DIR)/
 endef
