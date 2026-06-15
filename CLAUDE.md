@@ -42,21 +42,21 @@ make package/uhttpd-mod-ws/compile V=s
 
 There is no host-side build, no test suite, and no `make check`. Verification is reading + on-device testing.
 
-### How we find uhttpd's plugin headers
+### How we get uhttpd's plugin headers
 
-uhttpd's package has no `Build/InstallDev` recipe — its plugin headers (`uhttpd.h`, `plugin.h`) are **not** installed to `$(STAGING_DIR)`. But `PKG_BUILD_DEPENDS:=uhttpd` guarantees uhttpd's source tree is unpacked to `$(BUILD_DIR)/uhttpd-<version>/` before our compile starts, and those headers live at the root of that source tree.
+uhttpd has no `Build/InstallDev`, and trying to copy them from `$(BUILD_DIR)/uhttpd-*/` at `Build/Prepare` time fails because OpenWrt cleans the source tree after each dependency's install — by the time our package builds, the headers are gone from disk.
 
-The Makefile resolves the versioned directory at use-time via:
+The clean OpenWrt-canonical answer (per [jow's forum post](https://forum.openwrt.org/t/custom-packages-exporting-headers-and-linking-custom-packages/105035)) is `Build/InstallDev` in uhttpd's Makefile. We can't add that from outside uhttpd without forking its Makefile or patching the SDK in CI, and the project's GitHub workflow uses a reusable build script across multiple packages where injecting per-package SDK patches would be invasive.
 
-```makefile
-UHTTPD_SRC_DIR = $(firstword $(filter-out $(PKG_BUILD_DIR),$(wildcard $(BUILD_DIR)/uhttpd-*)))
-```
+**So we bundle.** `src/uhttpd.h`, `src/plugin.h`, `src/utils.h` are vendored copies from [openwrt/uhttpd@1b624f8f](https://github.com/openwrt/uhttpd/commit/1b624f8f814ed568608d756512892416e0431d77) (master as of 2026-05-17). uhttpd's plugin ABI has been effectively stable since ~2013 — these three files change very rarely.
 
-Two things to note:
-- **Deferred `=`** (not `:=`) so the wildcard expands when `Build/Compile` runs, not at parse time when the dir doesn't exist yet.
-- **`filter-out $(PKG_BUILD_DIR)`** because our own `uhttpd-mod-ws-<ver>` dir matches `uhttpd-*` too — without the filter, the wildcard could pick our directory and produce a confusing build failure.
+Three things to keep aligned with upstream uhttpd, watched manually when bumping the vendored copies:
 
-The clean long-term fix would be a small upstream PR adding `Build/InstallDev` to openwrt's uhttpd Makefile (installs `uhttpd.h` + `plugin.h` to `$(STAGING_DIR)/usr/include/uhttpd/`). That would benefit any future plugin author too. Until then, the wildcard pattern is the standard workaround for feed packages consuming headers from a non-Dev-installing dep.
+1. **`utils.h`** — pulled in by `uhttpd.h` via a relative `#include "utils.h"`. Only system headers from there, no further uhttpd internals.
+2. **`HAVE_TLS`** — set in `Build/Compile` via `-DHAVE_TLS`. uhttpd in openwrt builds with this flag set, which adds a `struct ustream_ssl ssl` member to `struct client`. Fields we access (`request`, `hdr`, `dispatch`) come AFTER it, so the struct offsets only match if our compile also defines it. (`HAVE_UBUS` and `HAVE_UCODE` add fields only at the *end* of structs we use, so omitting them doesn't shift our offsets and we save a dep.)
+3. **`+libustream-ssl`** — added to `DEPENDS` because `<libubox/ustream-ssl.h>` is what `HAVE_TLS` pulls in. The virtual `libustream-ssl` package is provided by `libustream-mbedtls`, `libustream-openssl`, or `libustream-wolfssl`.
+
+**Long-term cleanup:** when an upstream PR adds `Build/InstallDev` to openwrt's `package/network/services/uhttpd/Makefile` and lands on a release branch we target, delete the three bundled headers from `src/`, drop `-DHAVE_TLS` (since uhttpd's installed headers will carry the right config), and `-I$(STAGING_DIR)/usr/include/uhttpd` will Just Work.
 
 ## Required dependencies (runtime)
 
