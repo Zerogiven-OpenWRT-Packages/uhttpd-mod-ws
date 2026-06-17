@@ -47,4 +47,14 @@ define Package/$(PKG_NAME)/install
 	$(INSTALL_DATA) ./files/www/luci-static/resources/rpc-ws.js $(1)//www/luci-static/resources/rpc-ws.js
 endef
 
+# uhttpd dlopen()s plugins from /usr/lib/uhttpd at startup, so a freshly
+# installed .so is invisible until uhttpd is restarted. Skip when staging
+# into an offline image build (IPKG_INSTROOT set).
+define Package/$(PKG_NAME)/postinst
+#!/bin/sh
+[ -n "$${IPKG_INSTROOT}" ] && exit 0
+/etc/init.d/uhttpd enabled && /etc/init.d/uhttpd reload >/dev/null 2>&1
+exit 0
+endef
+
 $(eval $(call BuildPackage,uhttpd-mod-ws))
