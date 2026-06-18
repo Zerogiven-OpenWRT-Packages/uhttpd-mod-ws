@@ -24,7 +24,7 @@ define Package/$(PKG_NAME)
   SUBMENU:=Web Servers/Proxies
   TITLE:=WebSocket transport for ubus JSON RPC
   URL:=https://github.com/zerogiven/owrt-uhttpd-mod-ws
-  DEPENDS:=uhttpd +libubus +libubox +libblobmsg-json +libjson-c +libwebsockets +libustream-ssl
+  DEPENDS:=uhttpd +libubus +libubox +libblobmsg-json +libjson-c +libwebsockets
 endef
 
 define Package/$(PKG_NAME)/description
