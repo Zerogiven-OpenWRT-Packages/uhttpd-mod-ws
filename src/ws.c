@@ -86,6 +86,16 @@
 #define RPC_ERR_ACCESS       -32002         /* matches LuCI's index.uc */
 #define RPC_ERR_TOO_MANY     -32005         /* our: subscription cap */
 
+/*
+ * Max [/{ nesting depth we allow in any inbound JSON. json-c's parser
+ * uses recursion for nested containers, so a deeply-nested payload like
+ * "[[[...nest N times...]]]" eats N stack frames. With ~8 MB default
+ * stack and ~200B per json-c frame, 32 is comfortably under any limit
+ * while still allowing realistic payloads (JSON-RPC is rarely nested
+ * more than 4-5 levels deep in practice).
+ */
+#define WS_MAX_JSON_DEPTH    32
+
 /* ---- module-level state ------------------------------------------------- */
 
 static const struct uhttpd_ops *ops;
@@ -120,6 +130,10 @@ struct ws_conn {
     /* outbound queue drained from LWS_CALLBACK_SERVER_WRITEABLE */
     struct list_head  tx_queue;
     size_t            tx_bytes;     /* total queued payload (backlog cap) */
+
+    /* in-flight async ubus calls -- entries are struct ws_pending_call.
+     * teardown detaches them by setting their ->conn to NULL. */
+    struct list_head  pending_calls;
 };
 
 struct ws_tx_msg {
@@ -135,6 +149,20 @@ struct ws_sub {
     struct ubus_subscriber sub;
     uint32_t               obj_id;
     char                   path[];
+};
+
+/*
+ * One per in-flight async ubus call. Held in c->pending_calls until the
+ * complete_cb fires. If the WS connection tears down while a call is
+ * in-flight, ws_conn_teardown() sets ->conn=NULL so the complete_cb
+ * knows to drop the reply rather than write to a freed connection.
+ */
+struct ws_pending_call {
+    struct list_head      link;        /* on c->pending_calls            */
+    struct ws_conn       *conn;        /* NULL == conn torn down -- drop */
+    struct json_object   *id;          /* owned ref to JSON-RPC id       */
+    struct json_object   *out;         /* set by data_cb, drained by cb  */
+    struct ubus_request   req;
 };
 
 /* ---- forward decls ----------------------------------------------------- */
@@ -166,6 +194,64 @@ get_header(struct client *cl, const char *name)
 }
 
 /*
+ * Return the rpcd "session" object id, looking it up on demand if the
+ * cached value is stale. session_obj_id is module-static and zero-init
+ * via BSS; if the lookup at plugin init failed (rpcd not yet running),
+ * we retry on each auth/ACL call so the plugin recovers once rpcd is up.
+ */
+static bool
+get_session_obj_id(uint32_t *out)
+{
+    if (session_obj_id != 0) { *out = session_obj_id; return true; }
+    if (ubus_lookup_id(ubus_ctx, "session", &session_obj_id) == 0) {
+        *out = session_obj_id;
+        return true;
+    }
+    return false;
+}
+
+/*
+ * Pre-flight depth check for inbound JSON. Walks the bytes once counting
+ * { and [, respecting "..." string boundaries and \ escapes. Returns
+ * false if nesting depth would exceed max_depth at any point. Cheap
+ * (linear scan, no allocation) -- runs before json-c's recursive parse.
+ */
+static bool
+json_depth_ok(const char *s, size_t len, int max_depth)
+{
+    int depth = 0;
+    bool in_string = false, escape = false;
+    size_t i;
+
+    for (i = 0; i < len; i++) {
+        char c = s[i];
+        if (escape)   { escape = false; continue; }
+        if (in_string) {
+            if      (c == '\\') escape = true;
+            else if (c == '"')  in_string = false;
+            continue;
+        }
+        if      (c == '"')                in_string = true;
+        else if (c == '[' || c == '{')    { if (++depth > max_depth) return false; }
+        else if (c == ']' || c == '}')    { if (--depth < 0)         return false; }
+    }
+    return true;
+}
+
+/* Used by both auth paths so they enforce the same 32-hex-char shape. */
+static bool
+is_32hex(const char *s)
+{
+    size_t i;
+    for (i = 0; i < 32; i++)
+        if (!((s[i] >= '0' && s[i] <= '9') ||
+              (s[i] >= 'a' && s[i] <= 'f') ||
+              (s[i] >= 'A' && s[i] <= 'F')))
+            return false;
+    return true;
+}
+
+/*
  * Extract a 32-hex sid from a Sec-WebSocket-Protocol header value of the
  * form "ubus-json-rpc-v1, bearer.<32 hex chars>". Returns pointer into
  * the header value (NOT NUL-terminated at sid end).
@@ -178,16 +264,10 @@ find_sid_in_subprotocol(const char *hdr)
 
     while (p && *p) {
         while (*p == ' ' || *p == ',') p++;
-        if (!strncasecmp(p, WS_BEARER_TAG, tag_len)) {
-            const char *sid = p + tag_len;
-            size_t i;
-            for (i = 0; i < 32; i++)
-                if (!((sid[i] >= '0' && sid[i] <= '9') ||
-                      (sid[i] >= 'a' && sid[i] <= 'f') ||
-                      (sid[i] >= 'A' && sid[i] <= 'F')))
-                    break;
-            if (i == 32) return sid;
-        }
+        if (!strncasecmp(p, WS_BEARER_TAG, tag_len) &&
+            strlen(p + tag_len) >= 32 &&
+            is_32hex(p + tag_len))
+            return p + tag_len;
         p = strchr(p, ',');
     }
     return NULL;
@@ -207,7 +287,11 @@ ws_authenticate(struct client *cl, char out_sid[33])
     if (!sid_src && auth && !strncasecmp(auth, "Bearer ", 7)) {
         const char *s = auth + 7;
         while (*s == ' ') s++;
-        if (strlen(s) == 32) sid_src = s;
+        /* Enforce 32-hex-char shape (same rule as the SWP path) -- a
+         * non-hex 32-char string would otherwise be passed to rpcd which
+         * would reject it, but checking here avoids the round-trip and
+         * keeps the two paths consistent. */
+        if (strlen(s) >= 32 && is_32hex(s)) sid_src = s;
     }
 
     if (!sid_src) return false;
@@ -215,17 +299,27 @@ ws_authenticate(struct client *cl, char out_sid[33])
     memcpy(out_sid, sid_src, 32);
     out_sid[32] = '\0';
 
+    /* Resolve "session" object id (with lazy re-lookup if rpcd wasn't
+     * running at plugin init). */
+    uint32_t sid_oid;
+    if (!get_session_obj_id(&sid_oid)) return false;
+
+    /* Probe session.access. We only accept err == 0 -- previously we also
+     * accepted UBUS_STATUS_PERMISSION_DENIED on the assumption that "any
+     * response from rpcd means the session exists", but expired/invalid
+     * sessions can also produce PERMISSION_DENIED, which let zombie WS
+     * connections through. Tightening to err == 0 only. */
     blob_buf_init(&req, 0);
     blobmsg_add_string(&req, "ubus_rpc_session", out_sid);
     blobmsg_add_string(&req, "scope", "ubus");
     blobmsg_add_string(&req, "object", "session");
     blobmsg_add_string(&req, "function", "access");
 
-    err = ubus_invoke(ubus_ctx, session_obj_id, "access",
+    err = ubus_invoke(ubus_ctx, sid_oid, "access",
                       req.head, NULL, NULL, 1000);
     blob_buf_free(&req);
 
-    return (err == 0 || err == UBUS_STATUS_PERMISSION_DENIED);
+    return err == 0;
 }
 
 static void
@@ -249,6 +343,9 @@ ws_acl_check(const char *sid, const char *obj, const char *fn)
     struct blob_buf req = {};
     bool allowed = false;
     int err;
+    uint32_t sid_oid;
+
+    if (!get_session_obj_id(&sid_oid)) return false;
 
     blob_buf_init(&req, 0);
     blobmsg_add_string(&req, "ubus_rpc_session", sid);
@@ -256,7 +353,7 @@ ws_acl_check(const char *sid, const char *obj, const char *fn)
     blobmsg_add_string(&req, "object", obj);
     blobmsg_add_string(&req, "function", fn);
 
-    err = ubus_invoke(ubus_ctx, session_obj_id, "access",
+    err = ubus_invoke(ubus_ctx, sid_oid, "access",
                       req.head, ws_acl_reply_cb, &allowed, 1000);
     blob_buf_free(&req);
 
@@ -390,16 +487,55 @@ ws_send_result(struct ws_conn *c, struct json_object *id, struct json_object *re
     json_object_put(r);
 }
 
+/*
+ * Async ubus_invoke callbacks. data_cb fires once per reply chunk and
+ * stashes the parsed JSON; complete_cb fires once when the call ends
+ * (success, error, or timeout) and is the only place we touch the WS
+ * connection. If conn has been torn down (->conn == NULL), we drop the
+ * reply silently.
+ */
 static void
-ws_call_reply_cb(struct ubus_request *r, int type, struct blob_attr *msg)
+ws_call_data_cb(struct ubus_request *r, int type, struct blob_attr *msg)
 {
-    struct json_object **out = r->priv;
+    struct ws_pending_call *pc = container_of(r, struct ws_pending_call, req);
     char *s = blobmsg_format_json(msg, true);
 
     (void)type;
 
-    *out = s ? json_tokener_parse(s) : NULL;
+    /* If multiple data chunks arrive, the last one wins; ubus calls typically
+     * have a single reply blob, but be defensive about repeat callbacks. */
+    if (pc->out) json_object_put(pc->out);
+    pc->out = s ? json_tokener_parse(s) : NULL;
     free(s);
+}
+
+static void
+ws_call_complete_cb(struct ubus_request *r, int status)
+{
+    struct ws_pending_call *pc = container_of(r, struct ws_pending_call, req);
+    struct ws_conn *c = pc->conn;
+
+    list_del(&pc->link);
+
+    if (c) {
+        if (status == UBUS_STATUS_OK) {
+            struct json_object *result = json_object_new_array();
+            json_object_array_add(result, json_object_new_int(0));
+            if (pc->out) {
+                json_object_array_add(result, pc->out);
+                pc->out = NULL;             /* ownership moves into result */
+            }
+            ws_send_result(c, pc->id, result);
+        } else {
+            ws_send_error(c, pc->id, -32000 - status, ubus_strerror(status));
+        }
+    }
+    /* If c == NULL the connection died while we were in flight; just drop
+     * everything. ws_send_* would write to a freed connection otherwise. */
+
+    if (pc->out) json_object_put(pc->out);
+    if (pc->id)  json_object_put(pc->id);
+    free(pc);
 }
 
 static void
@@ -410,8 +546,7 @@ ws_dispatch_call(struct ws_conn *c, struct json_object *id, struct json_object *
     struct blob_buf req = {};
     uint32_t oid;
     int err;
-    struct json_object *out = NULL;
-    struct json_object *result;
+    struct ws_pending_call *pc;
 
     if (!params || json_object_array_length(params) < 3) {
         ws_send_error(c, id, RPC_ERR_PARAMS, "Invalid parameters"); return;
@@ -427,11 +562,11 @@ ws_dispatch_call(struct ws_conn *c, struct json_object *id, struct json_object *
     obj = json_object_get_string(jobj);
     fn  = json_object_get_string(jfn);
 
-    if (!ws_acl_check(c->sid, obj, fn)) {
+    /* Unify "not found" and "no access" responses so an unauthenticated
+     * caller can't probe which ubus objects exist on the device. */
+    if (!ws_acl_check(c->sid, obj, fn) ||
+        ubus_lookup_id(ubus_ctx, obj, &oid)) {
         ws_send_error(c, id, RPC_ERR_ACCESS, "Access denied"); return;
-    }
-    if (ubus_lookup_id(ubus_ctx, obj, &oid)) {
-        ws_send_error(c, id, RPC_ERR_METHOD, "Object not found"); return;
     }
 
     blob_buf_init(&req, 0);
@@ -439,20 +574,31 @@ ws_dispatch_call(struct ws_conn *c, struct json_object *id, struct json_object *
         blobmsg_add_object(&req, jargs);
     blobmsg_add_string(&req, "ubus_rpc_session", c->sid);
 
-    err = ubus_invoke(ubus_ctx, oid, fn, req.head,
-                      ws_call_reply_cb, &out, 30000);
+    pc = calloc(1, sizeof(*pc));
+    if (!pc) {
+        blob_buf_free(&req);
+        ws_send_error(c, id, RPC_ERR_INTERNAL, "OOM"); return;
+    }
+    pc->conn = c;
+    pc->id   = id ? json_object_get(id) : NULL;     /* take ref */
+
+    err = ubus_invoke_async(ubus_ctx, oid, fn, req.head, &pc->req);
     blob_buf_free(&req);
 
     if (err) {
+        if (pc->id) json_object_put(pc->id);
+        free(pc);
         ws_send_error(c, id, -32000 - err, ubus_strerror(err));
-        if (out) json_object_put(out);
         return;
     }
 
-    result = json_object_new_array();
-    json_object_array_add(result, json_object_new_int(0));
-    if (out) json_object_array_add(result, out);
-    ws_send_result(c, id, result);
+    pc->req.data_cb     = ws_call_data_cb;
+    pc->req.complete_cb = ws_call_complete_cb;
+    list_add_tail(&pc->link, &c->pending_calls);
+
+    /* Fire and forget -- complete_cb sends the reply when ubusd answers
+     * or the request times out. uhttpd's uloop stays responsive. */
+    ubus_complete_request_async(ubus_ctx, &pc->req);
 }
 
 static void
@@ -492,11 +638,10 @@ ws_dispatch_subscribe(struct ws_conn *c, struct json_object *id,
     if (c->num_subs >= c->max_subs) {
         ws_send_error(c, id, RPC_ERR_TOO_MANY, "Too many subscriptions"); return;
     }
-    if (!ws_acl_check(c->sid, path, ":subscribe")) {
+    /* Unify "not found" and "no access" -- see ws_dispatch_call comment. */
+    if (!ws_acl_check(c->sid, path, ":subscribe") ||
+        ubus_lookup_id(ubus_ctx, path, &oid)) {
         ws_send_error(c, id, RPC_ERR_ACCESS, "Access denied"); return;
-    }
-    if (ubus_lookup_id(ubus_ctx, path, &oid)) {
-        ws_send_error(c, id, RPC_ERR_METHOD, "Object not found"); return;
     }
 
     s = calloc(1, sizeof(*s) + strlen(path) + 1);
@@ -507,8 +652,16 @@ ws_dispatch_subscribe(struct ws_conn *c, struct json_object *id,
     s->node.key = s->path;
     s->sub.cb = ws_notify_cb;
 
+    /* Split error paths: only call ubus_unregister_subscriber if register
+     * actually succeeded. Unregistering an unregistered subscriber is
+     * undefined behaviour in libubus. */
     err = ubus_register_subscriber(ubus_ctx, &s->sub);
-    if (!err) err = ubus_subscribe(ubus_ctx, &s->sub, oid);
+    if (err) {
+        free(s);
+        ws_send_error(c, id, RPC_ERR_INTERNAL, ubus_strerror(err));
+        return;
+    }
+    err = ubus_subscribe(ubus_ctx, &s->sub, oid);
     if (err) {
         ubus_unregister_subscriber(ubus_ctx, &s->sub);
         free(s);
@@ -557,11 +710,22 @@ ws_handle_jsonrpc(struct ws_conn *c, const char *json, size_t len)
     const char *method;
     int rv = 0;
 
+    /* Reject pathologically nested JSON before it hits json-c's recursive
+     * parser. This bounds stack consumption to ~WS_MAX_JSON_DEPTH frames. */
+    if (!json_depth_ok(json, len, WS_MAX_JSON_DEPTH)) {
+        ws_send_error(c, NULL, RPC_ERR_PARSE, "Parse error"); rv = -1; goto out;
+    }
+
     req = json_tokener_parse_ex(tok, json, len);
     if (!req || !json_object_is_type(req, json_type_object)) {
         ws_send_error(c, NULL, RPC_ERR_PARSE, "Parse error"); rv = -1; goto out;
     }
+    /* Type-check every field before string-comparing it.
+     * json_object_object_get_ex only confirms the key EXISTS; the value
+     * could be a number/array/whatever. json_object_get_string returns
+     * NULL on non-string types, and strcmp(NULL, ...) segfaults. */
     if (!json_object_object_get_ex(req, "jsonrpc", &jver) ||
+        !json_object_is_type(jver, json_type_string) ||
         strcmp(json_object_get_string(jver), "2.0") != 0 ||
         !json_object_object_get_ex(req, "method", &jmethod) ||
         !json_object_is_type(jmethod, json_type_string)) {
@@ -603,9 +767,14 @@ ws_notify_cb(struct ubus_context *ctx, struct ubus_object *obj,
     json_object_array_add(params, json_object_new_string(s->path));
     json_object_array_add(params, json_object_new_string(method ? method : ""));
 
+    /* Defensive: blob_json may parse to NULL on malformed input. We must
+     * never add NULL to a json array -- json-c's behaviour on serialization
+     * is undefined and has been observed to crash. Fall back to an empty
+     * object so the notify shape is always well-formed. */
     blob_json = msg ? blobmsg_format_json(msg, true) : NULL;
-    data = blob_json ? json_tokener_parse(blob_json) : json_object_new_object();
+    data = blob_json ? json_tokener_parse(blob_json) : NULL;
     free(blob_json);
+    if (!data) data = json_object_new_object();
     json_object_array_add(params, data);
 
     json_object_object_add(frame, "jsonrpc", json_object_new_string("2.0"));
@@ -628,6 +797,24 @@ ws_conn_teardown(struct ws_conn *c)
 {
     struct ws_sub *s, *tmp;
     struct ws_tx_msg *m, *mtmp;
+    struct ws_pending_call *pc;
+
+    /*
+     * If we never reached ESTABLISHED, the list/avl heads are still
+     * zero-init and walking them would crash. CLOSED *usually* only fires
+     * after ESTABLISHED, but defensive: bail out if nothing was set up.
+     */
+    if (!c->established) return;
+
+    /*
+     * Detach in-flight async ubus calls. We can't safely free them here
+     * because ubusd may still call back into them; instead set ->conn=NULL
+     * so ws_call_complete_cb knows to drop the reply rather than write to
+     * a freed connection. The pc struct itself is freed by its complete_cb
+     * when ubusd finally responds (or its 30s timeout fires).
+     */
+    list_for_each_entry(pc, &c->pending_calls, link)
+        pc->conn = NULL;
 
     avl_for_each_element_safe(&c->subs, s, node, tmp) {
         avl_delete(&c->subs, &s->node);
@@ -665,6 +852,7 @@ ws_lws_cb(struct lws *wsi, enum lws_callback_reasons reason,
         c->max_subs = WS_MAX_SUBS_DEFAULT;
         INIT_LIST_HEAD(&c->tx_queue);
         c->tx_bytes = 0;
+        INIT_LIST_HEAD(&c->pending_calls);
 
         if (pending_sid) {
             memcpy(c->sid, pending_sid, 33);
@@ -763,7 +951,12 @@ ws_handle_request(struct client *cl, char *url, struct path_info *pi)
         snprintf(detail, sizeof(detail),
                  "Origin '%s' does not match Host '%s'",
                  o ? o : "(missing)", h ? h : "(missing)");
-        ops->client_error(cl, 403, "Forbidden", detail);
+        /* CRITICAL: client_error's `fmt` argument is printf-style. The
+         * `detail` we just built includes attacker-controlled bytes from
+         * the Origin/Host headers; passing it as the format string would
+         * be a classic format-string vulnerability. Pass it as a %s value
+         * instead. */
+        ops->client_error(cl, 403, "Forbidden", "%s", detail);
         return;
     }
 

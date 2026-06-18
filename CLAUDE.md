@@ -54,7 +54,7 @@ Three things to keep aligned with upstream uhttpd, watched manually when bumping
 
 1. **`utils.h`** — pulled in by `uhttpd.h` via a relative `#include "utils.h"`. Only system headers from there, no further uhttpd internals.
 2. **`HAVE_TLS`** — set in `Build/Compile` via `-DHAVE_TLS`. uhttpd in openwrt builds with this flag set, which adds a `struct ustream_ssl ssl` member to `struct client`. Fields we access (`request`, `hdr`, `dispatch`) come AFTER it, so the struct offsets only match if our compile also defines it. (`HAVE_UBUS` and `HAVE_UCODE` add fields only at the *end* of structs we use, so omitting them doesn't shift our offsets and we save a dep.)
-3. **`+libustream-ssl`** — added to `DEPENDS` because `<libubox/ustream-ssl.h>` is what `HAVE_TLS` pulls in. The virtual `libustream-ssl` package is provided by `libustream-mbedtls`, `libustream-openssl`, or `libustream-wolfssl`.
+3. **`<libubox/ustream-ssl.h>` header** — pulled in by uhttpd.h when `HAVE_TLS` is defined. We do NOT declare a runtime dep on `libustream-ssl-*` because we don't link or call it; the header is provided transitively by uhttpd's own build chain (uhttpd is compiled with `HAVE_TLS` so it pulls in a libustream variant, whose `Build/InstallDev` stages the header before our compile runs). There is no virtual `libustream-ssl` package — variants do not declare `PROVIDES`.
 
 **Long-term cleanup:** when an upstream PR adds `Build/InstallDev` to openwrt's `package/network/services/uhttpd/Makefile` and lands on a release branch we target, delete the three bundled headers from `src/`, drop `-DHAVE_TLS` (since uhttpd's installed headers will carry the right config), and `-I$(STAGING_DIR)/usr/include/uhttpd` will Just Work.
 
@@ -65,6 +65,7 @@ Three things to keep aligned with upstream uhttpd, watched manually when bumping
 - `libubox` (uloop, blobmsg, avl, list)
 - `libblobmsg-json`, `libjson-c` (JSON ↔ blob translation)
 - `libwebsockets` (RFC 6455 framing + handshake). DEPENDS uses the virtual `libwebsockets` name; satisfied by **`libwebsockets-mbedtls`** (PROVIDES `libwebsockets`) or **`libwebsockets-full`** (PROVIDES `libwebsockets`). The standalone `libwebsockets-openssl` variant does NOT provide the virtual name — users wanting an openssl backend should install `libwebsockets-full` instead.
+- *No* runtime dep on `libustream-ssl-*` despite the bundled `uhttpd.h` referencing `<libubox/ustream-ssl.h>` under `HAVE_TLS`. We need the header at **compile time** only — our `.so` never calls a `ustream_ssl_*` function. The header reaches `$(STAGING_DIR)` transitively: `PKG_BUILD_DEPENDS:=uhttpd` builds uhttpd before us; uhttpd compiles with `HAVE_TLS` so its own DEPENDS pulls in whichever libustream-ssl variant the target picked; that variant's `Build/InstallDev` stages the header. There's no virtual `libustream-ssl` package, so `+libustream-ssl` would not resolve — the transitive route is the right answer.
 - `rpcd` (provides the `session` ubus object — auth + ACL gating)
 
 ## Critical design constraints
@@ -100,9 +101,18 @@ libwebsockets enforces several protocol-level guards automatically (frame size a
 - **Per-connection subscription cap**: 64 (configurable). Reject further `subscribe` with JSON-RPC `-32005`.
 - **Outbound backlog**: 1 MiB queued. On overflow we set `PENDING_TIMEOUT_USER_OK` / `LWS_TO_KILL_ASYNC` to ask libwebsockets to drop the connection cleanly.
 - **Max single inbound frame**: 1 MiB via `rx_buffer_size` on the protocols entry — libwebsockets enforces.
+- **Max JSON nesting depth**: 32. Pre-flight scan (`json_depth_ok`) rejects pathologically nested payloads before json-c's recursive parser ever touches them. Bounds stack consumption regardless of input size.
 - **Liveness**: libwebsockets has built-in PING/PONG bookkeeping; tune via `lws_context_creation_info::ws_ping_pong_interval` if you want stricter than the default.
 
 Adjust the constants for the deployment but do not remove the guards.
+
+### 5. Async ubus dispatch
+
+`ws_dispatch_call` uses `ubus_invoke_async` + `ubus_complete_request_async`, NOT the synchronous `ubus_invoke`. Sync invocation would block uhttpd's entire uloop for up to the call's timeout (30s) — every other client, every other connection frozen. Async dispatch keeps uhttpd responsive while a single slow ubus method runs.
+
+Per-connection state tracks in-flight calls (`c->pending_calls`). When a WS connection tears down with calls still pending, `ws_conn_teardown` sets each `pending_call->conn = NULL`; the call completes naturally in libubus's queue, and `ws_call_complete_cb` notices the NULL and drops the reply rather than writing to a freed connection.
+
+`ws_acl_check` and `ws_authenticate` still call `ubus_invoke` synchronously, but with 1s timeouts — the blocking is bounded and these are not on the hot path of a long-lived stream.
 
 ## Wire protocol (Candidate α, mirrors `/ubus`)
 
