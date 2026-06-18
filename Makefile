@@ -43,8 +43,8 @@ endef
 
 define Package/$(PKG_NAME)/install
 	$(INSTALL_DIR) $(1)/usr/lib/uhttpd $(1)/www/luci-static/resources
-	$(INSTALL_BIN) $(PKG_BUILD_DIR)/uhttpd_ws.so $(1)/usr/lib/
-	$(INSTALL_DATA) ./files/www/luci-static/resources/rpc-ws.js $(1)//www/luci-static/resources/rpc-ws.js
+	$(INSTALL_BIN) $(PKG_BUILD_DIR)/uhttpd_ws.so $(1)/usr/lib/uhttpd/
+	$(INSTALL_DATA) ./files/www/luci-static/resources/rpc-ws.js $(1)/www/luci-static/resources/rpc-ws.js
 endef
 
 # uhttpd dlopen()s plugins from /usr/lib/uhttpd at startup, so a freshly
