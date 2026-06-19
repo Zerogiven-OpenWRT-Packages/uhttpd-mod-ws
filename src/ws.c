@@ -1119,6 +1119,14 @@ ws_plugin_init(const struct uhttpd_ops *o, struct config *c)
     return 0;
 }
 
+/*
+ * Explicitly export uhttpd_plugin. We build with -fvisibility=hidden so
+ * internal symbols stay private, but uhttpd's plugin loader calls
+ * dlsym(handle, "uhttpd_plugin") which only sees the dynamic symbol
+ * table -- without this attribute, the lookup would silently fail and
+ * uhttpd would skip loading us entirely (no error log, plugin invisible).
+ */
+__attribute__((visibility("default")))
 struct uhttpd_plugin uhttpd_plugin = {
     .init = ws_plugin_init,
 };
