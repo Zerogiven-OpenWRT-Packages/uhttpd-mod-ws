@@ -106,7 +106,26 @@ libwebsockets enforces several protocol-level guards automatically (frame size a
 
 Adjust the constants for the deployment but do not remove the guards.
 
-### 5. Async ubus dispatch
+### 5. Symbol visibility — uhttpd_plugin MUST be exported
+
+We compile with `-fvisibility=hidden` so internal helpers (auth, JSON parsing, callbacks) stay private. uhttpd's plugin loader uses `dlsym(handle, "uhttpd_plugin")` which looks in the .so's dynamic symbol table only — if our `uhttpd_plugin` symbol is hidden, the lookup silently returns NULL and uhttpd skips loading us entirely (no error, no log).
+
+The fix is in `ws.c`'s final declaration:
+
+```c
+__attribute__((visibility("default")))
+struct uhttpd_plugin uhttpd_plugin = { .init = ws_plugin_init };
+```
+
+If you ever see "no log lines, .so present but uhttpd doesn't pick it up", check this first:
+
+```sh
+nm -D /usr/lib/uhttpd/uhttpd_ws.so | grep uhttpd_plugin
+# Expect: 0000000000000XXX D uhttpd_plugin
+# If empty, the visibility attribute is missing or has wrong syntax.
+```
+
+### 6. Async ubus dispatch
 
 `ws_dispatch_call` uses `ubus_invoke_async` + `ubus_complete_request_async`, NOT the synchronous `ubus_invoke`. Sync invocation would block uhttpd's entire uloop for up to the call's timeout (30s) — every other client, every other connection frozen. Async dispatch keeps uhttpd responsive while a single slow ubus method runs.
 
