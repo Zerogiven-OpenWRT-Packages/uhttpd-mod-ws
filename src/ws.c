@@ -1,24 +1,13 @@
 /*
- * uhttpd-mod-ws -- RFC 6455 WebSocket transport for ubus JSON-RPC
+ * ubus-wsd -- WebSocket transport daemon for ubus JSON-RPC.
  *
- * Plugin model:  uhttpd .so plugin. uhttpd owns the listening socket(s),
- *                TLS termination, and uloop. We dispatch on /<ubus_prefix>-ws,
- *                hand the upgraded socket to libwebsockets via
- *                lws_adopt_socket_readbuf(), and from there libwebsockets
- *                handles the RFC 6455 protocol (handshake, framing, masking,
- *                control frames, UTF-8 validation, close codes).
+ * Standalone daemon (NOT a uhttpd plugin -- uhttpd's plugin loader is
+ * hardcoded to three internal plugins and doesn't accept third parties).
+ * We listen on our own TLS port via libwebsockets, authenticate via
+ * rpcd's session.access, and dispatch to ubus.
  *
- * Why libwebsockets:
- *   We replaced ~600 LOC of hand-rolled WS code (frame parser, mask
- *   handling, opcode dispatch, handshake hash, frame writer) with calls
- *   into libwebsockets. The deleted code was the security-sensitive part:
- *   audited library > brand-new C parser, especially on a router host.
- *   OpenWrt builds libwebsockets with LWS_WITH_ULOOP=ON so the library
- *   shares uhttpd's existing uloop -- no event-loop bridge needed.
- *
- * Endpoint:     <ubus_prefix>-ws (e.g. /ubus-ws). Sibling of /ubus, NOT a
- *               child -- mod-ubus's check_url would intercept /ubus/ws.
- *               If c->ubus_prefix is empty, we don't register.
+ * Endpoint:     wss://<host>:<port>/ubus-ws where <port> comes from
+ *               /etc/config/ubus-ws (default 8443).
  *
  * Wire:         JSON-RPC 2.0 mirroring /ubus:
  *                 call/list/subscribe/unsubscribe (id, params)
@@ -64,12 +53,10 @@
 #include <json-c/json.h>
 #include <libwebsockets.h>
 
-#include "uhttpd.h"
-#include "plugin.h"
+#include "ws.h"
 
 /* ---- constants ---------------------------------------------------------- */
 
-#define WS_SUFFIX            "-ws"
 #define WS_SUBPROTO          "ubus-json-rpc-v1"
 #define WS_BEARER_TAG        "bearer."
 
@@ -98,18 +85,18 @@
 
 /* ---- module-level state ------------------------------------------------- */
 
-static const struct uhttpd_ops *ops;
-static struct config           *_conf;
 static struct ubus_context     *ubus_ctx;
 static uint32_t                 session_obj_id;
-
-/* runtime-derived endpoint prefix: "<c->ubus_prefix>-ws" */
-static char     runtime_prefix[128];
-static size_t   runtime_prefix_len;
 
 /* libwebsockets state */
 static struct lws_context      *lws_ctx;
 static struct lws_vhost        *lws_vh;
+
+/* URL path our protocol responds to */
+#define WS_URL_PATH             "/ubus-ws"
+
+/* Cached allowed-origin-hosts array from config (NULL = same-host fallback) */
+static const char **allowed_origin_hosts;
 
 /* ---- per-connection state ---------------------------------------------- *
  *
@@ -178,19 +165,23 @@ static void  ws_conn_teardown(struct ws_conn *c);
 
 /* ---- header / auth helpers -------------------------------------------- */
 
-static const char *
-get_header(struct client *cl, const char *name)
+/*
+ * Copy a header value identified by a libwebsockets token into `buf`. Returns
+ * the length on success (without trailing NUL), or -1 if the header is
+ * missing or wouldn't fit in `buflen`. The result is always NUL-terminated
+ * on success.
+ *
+ * Tokens commonly used: WSI_TOKEN_HOST, WSI_TOKEN_HTTP_ORIGIN,
+ * WSI_TOKEN_HTTP_AUTHORIZATION, WSI_TOKEN_PROTOCOL (Sec-WebSocket-Protocol).
+ */
+static int
+get_hdr(struct lws *wsi, enum lws_token_indexes tok, char *buf, size_t buflen)
 {
-    struct blob_attr *cur;
-    int rem;
-
-    /* uhttpd stores parsed request headers in cl->hdr as a blobmsg. Names
-     * are lowercased on the way in; iterate case-insensitively so callers
-     * can pass the canonical mixed-case form they wrote in the spec. */
-    blob_for_each_attr(cur, cl->hdr.head, rem)
-        if (!strcasecmp(blobmsg_name(cur), name))
-            return blobmsg_get_string(cur);
-    return NULL;
+    int len = lws_hdr_total_length(wsi, tok);
+    if (len <= 0 || (size_t)len >= buflen) return -1;
+    if (lws_hdr_copy(wsi, buf, buflen, tok) < 0) return -1;
+    buf[len] = '\0';
+    return len;
 }
 
 /*
@@ -274,11 +265,14 @@ find_sid_in_subprotocol(const char *hdr)
 }
 
 static bool
-ws_authenticate(struct client *cl, char out_sid[33])
+ws_authenticate(struct lws *wsi, char out_sid[33])
 {
+    char swp_buf[512], auth_buf[256];
     const char *sid_src = NULL;
-    const char *swp = get_header(cl, "Sec-WebSocket-Protocol");
-    const char *auth = get_header(cl, "Authorization");
+    const char *swp  = (get_hdr(wsi, WSI_TOKEN_PROTOCOL,
+                                swp_buf,  sizeof(swp_buf))  > 0) ? swp_buf  : NULL;
+    const char *auth = (get_hdr(wsi, WSI_TOKEN_HTTP_AUTHORIZATION,
+                                auth_buf, sizeof(auth_buf)) > 0) ? auth_buf : NULL;
     struct blob_buf req = {};
     int err;
 
@@ -360,10 +354,24 @@ ws_acl_check(const char *sid, const char *obj, const char *fn)
     return (err == 0) && allowed;
 }
 
-/* ---- Origin validation (CSWSH defense in depth) ----------------------- */
+/* ---- Origin validation (CSWSH defense in depth) ----------------------- *
+ *
+ * Policy: extract the bare hostname from Origin and compare to either
+ *   (a) the bare hostname from the Host header (default permissive mode --
+ *       "same-host any-port"), OR
+ *   (b) any entry in the UCI allowed_origin_hosts allowlist (strict mode,
+ *       opt-in by configuring the list).
+ *
+ * Port differences are tolerated because typical deployments run LuCI
+ * on port 443 and us on port 8443 -- same host, different ports.
+ *
+ * IPv6 host literals (`[::1]:8443` / `[::1]`) are stripped of brackets.
+ * Plain hostname/IPv4 ("router.lan", "192.168.1.1") flows through.
+ */
 
+/* Pull the bare hostname out of "scheme://host[:port]/path..." */
 static const char *
-hostport_from_origin(const char *origin, char *buf, size_t buflen)
+hostname_from_origin(const char *origin, char *buf, size_t buflen)
 {
     const char *p, *end;
     size_t n;
@@ -372,64 +380,80 @@ hostport_from_origin(const char *origin, char *buf, size_t buflen)
     if (!p) return NULL;
     p += 3;
 
-    end = strchr(p, '/');
-    n = end ? (size_t)(end - p) : strlen(p);
-    if (n == 0 || n >= buflen) return NULL;
+    if (*p == '[') {                           /* IPv6 [::1]:port form */
+        end = strchr(p, ']');
+        if (!end) return NULL;
+        n = (size_t)(end - p - 1);
+        if (n == 0 || n >= buflen) return NULL;
+        memcpy(buf, p + 1, n);
+        buf[n] = '\0';
+        return buf;
+    }
 
+    end = p;
+    while (*end && *end != ':' && *end != '/') end++;
+    n = (size_t)(end - p);
+    if (n == 0 || n >= buflen) return NULL;
     memcpy(buf, p, n);
     buf[n] = '\0';
     return buf;
 }
 
-static bool
-ws_origin_ok(struct client *cl)
+/* Pull the bare hostname out of a Host header value "host[:port]" */
+static const char *
+hostname_from_host(const char *host, char *buf, size_t buflen)
 {
-    const char *origin = get_header(cl, "Origin");
-    const char *host   = get_header(cl, "Host");
-    char obuf[256];
+    const char *end;
+    size_t n;
 
-    if (!origin) return true;                  /* non-browser -- allow */
-    if (!host)   return false;
-
-    if (!hostport_from_origin(origin, obuf, sizeof(obuf)))
-        return false;
-
-    return strcasecmp(obuf, host) == 0;
-}
-
-/* ---- request reconstruction for lws_adopt_socket_readbuf -------------- *
- *
- * uhttpd has already parsed the HTTP upgrade request: headers live in
- * cl->hdr (blobmsg, lowercased names), and the URL came in as the `url`
- * parameter to our handle_request callback. Rebuild the raw HTTP request
- * bytes so libwebsockets can drive its own handshake state machine.
- *
- * lws_adopt_socket_readbuf caps the readbuf at 2048 bytes (the ah rx buf);
- * a typical browser WS upgrade is 300-800 bytes so this fits comfortably.
- */
-static int
-ws_rebuild_request(struct client *cl, const char *url, char *buf, size_t buflen)
-{
-    int total, n, rem;
-    struct blob_attr *cur;
-
-    n = snprintf(buf, buflen, "GET %s HTTP/1.1\r\n", url ? url : "/");
-    if (n < 0 || (size_t)n >= buflen) return -1;
-    total = n;
-
-    blob_for_each_attr(cur, cl->hdr.head, rem) {
-        const char *hn = blobmsg_name(cur);
-        const char *hv = blobmsg_get_string(cur);
-        n = snprintf(buf + total, buflen - total, "%s: %s\r\n", hn, hv);
-        if (n < 0 || (size_t)(total + n) >= buflen) return -1;
-        total += n;
+    if (host[0] == '[') {                      /* IPv6 [::1]:port form */
+        end = strchr(host, ']');
+        if (!end) return NULL;
+        n = (size_t)(end - host - 1);
+        if (n == 0 || n >= buflen) return NULL;
+        memcpy(buf, host + 1, n);
+        buf[n] = '\0';
+        return buf;
     }
 
-    if ((size_t)(total + 2) >= buflen) return -1;
-    memcpy(buf + total, "\r\n", 2);
-    total += 2;
+    end = strchr(host, ':');
+    n = end ? (size_t)(end - host) : strlen(host);
+    if (n == 0 || n >= buflen) return NULL;
+    memcpy(buf, host, n);
+    buf[n] = '\0';
+    return buf;
+}
 
-    return total;
+static bool
+ws_origin_ok(struct lws *wsi)
+{
+    char origin_buf[256], host_buf[128];
+    char origin_host[128], host_host[128];
+    size_t i;
+
+    /* Origin absent: allow. Non-browser clients (curl, scripts) don't send
+     * it; Bearer auth still gates access. */
+    if (get_hdr(wsi, WSI_TOKEN_HTTP_ORIGIN, origin_buf, sizeof(origin_buf)) <= 0)
+        return true;
+
+    if (!hostname_from_origin(origin_buf, origin_host, sizeof(origin_host)))
+        return false;
+
+    /* Strict mode: UCI allowed_origin_hosts is the only authority. */
+    if (allowed_origin_hosts && allowed_origin_hosts[0]) {
+        for (i = 0; allowed_origin_hosts[i]; i++)
+            if (!strcasecmp(origin_host, allowed_origin_hosts[i]))
+                return true;
+        return false;
+    }
+
+    /* Permissive mode (default): Origin's hostname must equal Host's. */
+    if (get_hdr(wsi, WSI_TOKEN_HOST, host_buf, sizeof(host_buf)) <= 0)
+        return false;
+    if (!hostname_from_host(host_buf, host_host, sizeof(host_host)))
+        return false;
+
+    return strcasecmp(origin_host, host_host) == 0;
 }
 
 /* ---- tx queue --------------------------------------------------------- */
@@ -895,10 +919,44 @@ ws_lws_cb(struct lws *wsi, enum lws_callback_reasons reason,
         return 0;
     }
 
-    case LWS_CALLBACK_FILTER_PROTOCOL_CONNECTION:
-        /* Optional rejection point. We've already done auth + origin
-         * pre-adopt, so allow here. */
+    case LWS_CALLBACK_FILTER_PROTOCOL_CONNECTION: {
+        /*
+         * Daemon mode: we ARE the listener now, so this is the gate for
+         * the WS upgrade. Three checks:
+         *   1. URL must be our configured path (/ubus-ws) -- libwebsockets
+         *      doesn't route by URL for WS, just by subprotocol, so we
+         *      enforce the path ourselves to reject stray clients.
+         *   2. Origin must pass ws_origin_ok (CSWSH defense).
+         *   3. Sec-WebSocket-Protocol or Authorization must carry a valid
+         *      32-hex sid that rpcd recognizes (ws_authenticate).
+         * Stash the resolved sid via lws_set_opaque_user_data for the
+         * ESTABLISHED callback to copy into per_session_data.
+         */
+        char url[128];
+        char sid[33];
+        char *pending_sid;
+
+        if (get_hdr(wsi, WSI_TOKEN_GET_URI, url, sizeof(url)) <= 0 ||
+            strcmp(url, WS_URL_PATH) != 0) {
+            fprintf(stderr, "ubus-wsd: rejecting upgrade for URL '%s'\n",
+                    get_hdr(wsi, WSI_TOKEN_GET_URI, url, sizeof(url)) > 0 ? url : "?");
+            return 1;
+        }
+        if (!ws_origin_ok(wsi)) {
+            fprintf(stderr, "ubus-wsd: rejecting upgrade (Origin policy)\n");
+            return 1;
+        }
+        if (!ws_authenticate(wsi, sid)) {
+            fprintf(stderr, "ubus-wsd: rejecting upgrade (auth)\n");
+            return 1;
+        }
+
+        pending_sid = malloc(33);
+        if (!pending_sid) return 1;
+        memcpy(pending_sid, sid, 33);
+        lws_set_opaque_user_data(wsi, pending_sid);
         return 0;
+    }
 
     case LWS_CALLBACK_CLOSED:
         ws_conn_teardown(c);
@@ -930,203 +988,76 @@ static const struct lws_protocols ws_protocols[] = {
     { NULL, NULL, 0, 0, 0, NULL, 0 }    /* terminator */
 };
 
-/* ---- uhttpd dispatch entry -------------------------------------------- */
+/* ---- daemon entry / lifecycle ----------------------------------------- */
 
-static void
-ws_handle_request(struct client *cl, char *url, struct path_info *pi)
-{
-    char  sid[33];
-    char  reqbuf[2048];     /* lws ah rx buf limit */
-    int   rlen, fd;
-    char *pending_sid;
-    struct lws *wsi;
-
-    (void)pi;
-
-    /* CSWSH defense */
-    if (!ws_origin_ok(cl)) {
-        const char *o = get_header(cl, "Origin");
-        const char *h = get_header(cl, "Host");
-        char detail[256];
-        snprintf(detail, sizeof(detail),
-                 "Origin '%s' does not match Host '%s'",
-                 o ? o : "(missing)", h ? h : "(missing)");
-        /* CRITICAL: client_error's `fmt` argument is printf-style. The
-         * `detail` we just built includes attacker-controlled bytes from
-         * the Origin/Host headers; passing it as the format string would
-         * be a classic format-string vulnerability. Pass it as a %s value
-         * instead. */
-        ops->client_error(cl, 403, "Forbidden", "%s", detail);
-        return;
-    }
-
-    /* Bearer/SWP auth */
-    if (!ws_authenticate(cl, sid)) {
-        ops->client_error(cl, 401, "Unauthorized",
-            "Missing or invalid Bearer token");
-        return;
-    }
-
-    /* Rebuild the HTTP request bytes so libwebsockets can do the
-     * upgrade handshake itself. */
-    rlen = ws_rebuild_request(cl, url, reqbuf, sizeof(reqbuf));
-    if (rlen < 0) {
-        ops->client_error(cl, 400, "Bad Request", "Upgrade request too large");
-        return;
-    }
-
-    /* dup the socket fd so libwebsockets gets an independent reference.
-     * uhttpd will close its original fd via client_close below; the
-     * kernel TCP connection survives because lws holds the dup. */
-    /* cl->sfd is struct ustream_fd, which wraps a struct uloop_fd; the
-     * actual int file descriptor sits one level deeper. */
-    fd = dup(cl->sfd.fd.fd);
-    if (fd < 0) {
-        ops->client_error(cl, 500, "Internal Error", "dup() failed");
-        return;
-    }
-
-    /* Stash the sid for the ESTABLISHED callback to pick up. Heap-allocated
-     * because lws callbacks run later in uloop; freed in ESTABLISHED or
-     * WSI_DESTROY (covers the disconnect-before-established race). */
-    pending_sid = malloc(33);
-    if (!pending_sid) {
-        close(fd);
-        ops->client_error(cl, 500, "Internal Error", "OOM");
-        return;
-    }
-    memcpy(pending_sid, sid, 33);
-
-    wsi = lws_adopt_socket_readbuf(lws_ctx, fd, reqbuf, (size_t)rlen);
-    if (!wsi) {
-        /* lws_adopt_socket_readbuf already closed the fd on failure */
-        free(pending_sid);
-        ops->client_error(cl, 500, "Internal Error", "lws_adopt failed");
-        return;
-    }
-    lws_set_opaque_user_data(wsi, pending_sid);
-
-    /* Tell uhttpd we're done with this client. uhttpd's plugin vtable
-     * doesn't expose a "close socket" op; the right signal is
-     * request_done() which tears down the cl. Our dup'd fd survives. */
-    ops->request_done(cl);
-}
-
-/* ---- plugin registration ---------------------------------------------- */
-
-static bool
-ws_check_url(const char *url)
-{
-    if (runtime_prefix_len == 0) return false;
-    return strncmp(url, runtime_prefix, runtime_prefix_len) == 0 &&
-           (url[runtime_prefix_len] == '\0' ||
-            url[runtime_prefix_len] == '?' ||
-            url[runtime_prefix_len] == '/');
-}
-
-static struct dispatch_handler ws_dispatch = {
-    .script = false,
-    .check_url = ws_check_url,
-    .handle_request = ws_handle_request,
-};
-
-static int
-ws_lws_init(void)
+int
+ws_init(const struct ws_config *cfg)
 {
     struct lws_context_creation_info info = { 0 };
 
-    info.port              = CONTEXT_PORT_NO_LISTEN;   /* we don't listen; uhttpd does */
-    info.protocols         = ws_protocols;
-    info.gid               = -1;
-    info.uid               = -1;
-    info.options           = LWS_SERVER_OPTION_VALIDATE_UTF8 |
-                             LWS_SERVER_OPTION_DISABLE_IPV6;
-    /*
-     * TODO(verify on-device): the OpenWrt libwebsockets build is compiled
-     * with LWS_WITH_ULOOP=ON. The expected pattern for sharing uhttpd's
-     * uloop is one of:
-     *   (a) info.options |= LWS_SERVER_OPTION_ULOOP;
-     *       info.foreign_loops = (void *[]){ NULL };   // use default uloop
-     *   (b) Auto-detected -- lws picks up the running uloop when LWS_WITH_ULOOP
-     *       was set at compile time.
-     * Confirm by reading the lws context's selected event lib on first
-     * connection. Adjust the flags if uloop integration is not active.
-     */
-
-    lws_ctx = lws_create_context(&info);
-    if (!lws_ctx) return -1;
-
-    /* Default vhost for adoption -- no listener, no certs (uhttpd holds them) */
-    lws_vh = lws_create_vhost(lws_ctx, &info);
-    if (!lws_vh) {
-        lws_context_destroy(lws_ctx);
-        lws_ctx = NULL;
-        return -1;
-    }
-    return 0;
-}
-
-static int
-ws_plugin_init(const struct uhttpd_ops *o, struct config *c)
-{
-    int n;
-
-    ops = o;
-    _conf = c;
-
-    if (!c->ubus_prefix || !*c->ubus_prefix) {
-        fprintf(stderr, "uhttpd-mod-ws: ubus_prefix not set; not registered\n");
-        return 0;
-    }
-
-    n = snprintf(runtime_prefix, sizeof(runtime_prefix), "%s", c->ubus_prefix);
-    if (n < 0 || (size_t)n >= sizeof(runtime_prefix)) {
-        fprintf(stderr, "uhttpd-mod-ws: ubus_prefix too long\n");
-        return -1;
-    }
-    while (n > 0 && runtime_prefix[n - 1] == '/')
-        runtime_prefix[--n] = '\0';
-
-    if ((size_t)n + sizeof(WS_SUFFIX) > sizeof(runtime_prefix)) {
-        fprintf(stderr, "uhttpd-mod-ws: derived prefix too long\n");
-        return -1;
-    }
-    memcpy(runtime_prefix + n, WS_SUFFIX, sizeof(WS_SUFFIX));
-    runtime_prefix_len = n + sizeof(WS_SUFFIX) - 1;
-
-    ubus_ctx = ubus_connect(c->ubus_socket);
+    /* ubus first -- our auth path needs it before any WS connection arrives.
+     * Lazy re-lookup of session_obj_id in get_session_obj_id handles the
+     * case where rpcd starts after us. */
+    ubus_ctx = ubus_connect(cfg->ubus_socket);
     if (!ubus_ctx) {
-        fprintf(stderr, "uhttpd-mod-ws: ubus_connect(%s) failed\n",
-                c->ubus_socket ? c->ubus_socket : "default");
+        fprintf(stderr, "ubus-wsd: ubus_connect(%s) failed\n",
+                cfg->ubus_socket ? cfg->ubus_socket : "default");
         return -1;
     }
     ubus_add_uloop(ubus_ctx);
 
-    if (ubus_lookup_id(ubus_ctx, "session", &session_obj_id)) {
-        fprintf(stderr, "uhttpd-mod-ws: rpcd 'session' not found "
-                        "(install rpcd?)\n");
-    }
+    if (ubus_lookup_id(ubus_ctx, "session", &session_obj_id))
+        fprintf(stderr,
+            "ubus-wsd: rpcd 'session' not yet up; will retry on first auth\n");
 
-    if (ws_lws_init() < 0) {
-        fprintf(stderr, "uhttpd-mod-ws: libwebsockets init failed\n");
+    /* Origin allowlist is owned by main.c and outlives this call. */
+    allowed_origin_hosts = cfg->allowed_origin_hosts;
+
+    /* libwebsockets listening with TLS */
+    info.port                     = cfg->port;
+    info.protocols                = ws_protocols;
+    info.ssl_cert_filepath        = cfg->cert;
+    info.ssl_private_key_filepath = cfg->key;
+    info.gid                      = -1;
+    info.uid                      = -1;
+    info.options                  = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT |
+                                    LWS_SERVER_OPTION_VALIDATE_UTF8;
+
+    lws_ctx = lws_create_context(&info);
+    if (!lws_ctx) {
+        fprintf(stderr, "ubus-wsd: lws_create_context failed\n");
+        ubus_free(ubus_ctx);
+        ubus_ctx = NULL;
         return -1;
     }
 
-    ops->dispatch_add(&ws_dispatch);
+    lws_vh = lws_create_vhost(lws_ctx, &info);
+    if (!lws_vh) {
+        fprintf(stderr, "ubus-wsd: lws_create_vhost failed\n");
+        lws_context_destroy(lws_ctx);
+        lws_ctx = NULL;
+        ubus_free(ubus_ctx);
+        ubus_ctx = NULL;
+        return -1;
+    }
+
     fprintf(stderr,
-        "uhttpd-mod-ws: serving WebSocket JSON-RPC at %s (lws-backed)\n",
-        runtime_prefix);
+        "ubus-wsd: listening on :%d (TLS), endpoint %s\n",
+        cfg->port, WS_URL_PATH);
     return 0;
 }
 
-/*
- * Explicitly export uhttpd_plugin. We build with -fvisibility=hidden so
- * internal symbols stay private, but uhttpd's plugin loader calls
- * dlsym(handle, "uhttpd_plugin") which only sees the dynamic symbol
- * table -- without this attribute, the lookup would silently fail and
- * uhttpd would skip loading us entirely (no error log, plugin invisible).
- */
-__attribute__((visibility("default")))
-struct uhttpd_plugin uhttpd_plugin = {
-    .init = ws_plugin_init,
-};
+void
+ws_shutdown(void)
+{
+    if (lws_ctx) {
+        lws_context_destroy(lws_ctx);
+        lws_ctx = NULL;
+        lws_vh  = NULL;
+    }
+    if (ubus_ctx) {
+        ubus_free(ubus_ctx);
+        ubus_ctx = NULL;
+    }
+    allowed_origin_hosts = NULL;
+}

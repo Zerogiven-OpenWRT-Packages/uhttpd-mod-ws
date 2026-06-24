@@ -1,6 +1,7 @@
 'use strict';
 'require baseclass';
 'require rpc';
+'require uci';
 
 /**
  * @class rpc-ws
@@ -12,7 +13,8 @@
  * `LuCI.rpc` speaks over POST, with added subscribe/unsubscribe verbs
  * for server-to-client push (live logs, stats, events).
  *
- * Requires `uhttpd-mod-ws` on the device (sibling of `uhttpd-mod-ubus`).
+ * Requires the `ubus-wsd` daemon installed on the device. The daemon's
+ * listen port is read at runtime from /etc/config/ubus-ws via uci.load().
  *
  * Usage:
  *
@@ -39,21 +41,37 @@
  */
 
 /*
- * The WS endpoint lives at the uhttpd dispatch level, NOT under LuCI's
- * /cgi-bin/luci/admin/* tree. The path follows uhttpd's ubus_prefix:
- * mod-ubus serves /<prefix>, mod-ws serves /<prefix>-ws.
+ * ubus-wsd listens on its own port (separate from uhttpd). We discover
+ * that port at runtime by reading /etc/config/ubus-ws via uci.load(),
+ * which goes through LuCI's standard uci ubus call (HTTPS to uhttpd ->
+ * rpcd uci.get). The result is cached for the page lifetime.
  *
- * We reuse L.env.ubuspath (populated by luci-base from /etc/config/luci's
- * option ubuspath, default '/ubus/') as the source of truth -- one config
- * knob configures both rpc.js's direct path probe and rpc-ws.js's WS URL.
+ * The URL is constructed as wss://<same-host>:<port>/ubus-ws -- the
+ * daemon's URL endpoint is fixed in ws.c as WS_URL_PATH.
  */
-const WS_URL = (function () {
-	const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
-	const httpPath = (L.env.ubuspath ?? '/ubus/').replace(/\/+$/, '');
-	return scheme + '//' + location.host + httpPath + '-ws';
-})();
 
-const SUBPROTO = 'ubus-json-rpc-v1';
+const SUBPROTO     = 'ubus-json-rpc-v1';
+const WS_URL_PATH  = '/ubus-ws';
+const DEFAULT_PORT = 8443;
+
+/* Module-level cache: avoid re-fetching UCI for every new Connection. */
+let _wsUrlPromise = null;
+
+function getWsUrl() {
+	if (_wsUrlPromise) return _wsUrlPromise;
+	_wsUrlPromise = uci.load('ubus-ws').then(() => {
+		let port = parseInt(uci.get('ubus-ws', 'main', 'port'), 10);
+		if (!port || port <= 0 || port > 65535) port = DEFAULT_PORT;
+		const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
+		return `${scheme}//${location.hostname}:${port}${WS_URL_PATH}`;
+	}).catch(() => {
+		/* If uci.load fails (rpcd ACL missing, network blip, ubus-ws
+		 * package not installed yet) fall back to the default port. */
+		const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
+		return `${scheme}//${location.hostname}:${DEFAULT_PORT}${WS_URL_PATH}`;
+	});
+	return _wsUrlPromise;
+}
 
 const Connection = baseclass.extend(/** @lends LuCI.rpc-ws.Connection.prototype */ {
 	__init__() {
@@ -70,9 +88,27 @@ const Connection = baseclass.extend(/** @lends LuCI.rpc-ws.Connection.prototype 
 	/* ---- internals -------------------------------------------------- */
 
 	_open() {
-		const sid = rpc.getSessionID();
-		const ws  = new WebSocket(WS_URL, [SUBPROTO, 'bearer.' + sid]);
+		if (this.closing) return;
+		/* URL discovery is async (uci.load round-trip on first call). The
+		 * outbox queue already handles calls that happen before the WS is
+		 * open, so callers can fire-and-forget through call()/subscribe()
+		 * immediately after rpcws.connect() returns. */
+		getWsUrl().then(url => {
+			if (this.closing) return;
+			const sid = rpc.getSessionID();
+			const ws  = new WebSocket(url, [SUBPROTO, 'bearer.' + sid]);
+			this._wireWs(ws);
+		}).catch(err => {
+			/* URL discovery itself failed -- log and schedule a retry; the
+			 * outbox will drain when a future _open() succeeds. */
+			console.error('rpc-ws: URL discovery failed:', err);
+			if (!this.closing) this._scheduleReconnect();
+		});
+	},
 
+	/* Attach event handlers to a freshly-constructed WebSocket. Split out
+	 * of _open so the async fork stays small. */
+	_wireWs(ws) {
 		ws.onopen = () => {
 			this.backoffMs = 500;
 			/* flush queued frames */

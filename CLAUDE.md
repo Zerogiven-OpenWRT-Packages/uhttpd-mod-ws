@@ -4,69 +4,50 @@ This file provides guidance to Claude Code (claude.ai/code) when working in this
 
 ## What this project is
 
-`uhttpd-mod-ws` is a **uhttpd plugin** that adds an RFC 6455 WebSocket transport for ubus JSON-RPC. It is the sibling of `uhttpd-mod-ubus` and speaks the same JSON-RPC 2.0 dialect with two added verbs (`subscribe` / `unsubscribe`) for server→client push.
+`ubus-wsd` is a **standalone daemon** that exposes ubus JSON-RPC over a WebSocket endpoint. It listens on its own TLS port (default 8443), authenticates against rpcd's session.access just like uhttpd-mod-ubus does, and dispatches `call`, `list`, `subscribe`, and `unsubscribe` verbs to ubus.
 
-It is **not** a standalone server. It is a `.so` plugin loaded by uhttpd at startup (`/usr/lib/uhttpd/uhttpd_ws.so`) and gets its socket lifecycle, TLS termination (for `wss://`), and uloop integration from uhttpd itself.
-
-**Security-critical part of the implementation is delegated to libwebsockets**: RFC 6455 handshake (Sec-WebSocket-Accept hash, 101 response), frame parsing, mask removal, control-frame size enforcement, UTF-8 validation on TEXT frames, fragmentation reassembly, and close-code/reason validation are all done by libwebsockets — not by code we wrote. The handoff happens via `lws_adopt_socket_readbuf()` after uhttpd accepts the connection and our auth + Origin checks pass. OpenWrt's libwebsockets build has `LWS_WITH_ULOOP=ON`, so the library shares uhttpd's existing uloop natively — no event-loop bridge.
+It is NOT a uhttpd plugin. The earlier version of this project tried to be one (`uhttpd-mod-ws.so`), but uhttpd's plugin loader has a **hardcoded list** of plugins it will load (mod-ubus / mod-lua / mod-ucode) — there is no mechanism for third-party plugins to register. That architectural dead-end is why we became a standalone daemon. (Local-patched uhttpd was an option, but would have meant every consumer of our package needed to also ship a forked uhttpd build.)
 
 ## Where it fits
 
 ```
-  Browser ──wss──▶ uhttpd ──dlopen──▶ uhttpd_ws.so ──libubus──▶ ubusd
-                     │                                            │
-                     ├──▶ uhttpd_ubus.so   (POST /ubus, SSE)      │
-                     ├──▶ uhttpd_ucode.so  (forked ucode CGI)     │
-                     └──▶ uhttpd_lua.so    (forked Lua CGI)       │
-                                                                  │
-                                                          rpcd ───┘
-                                                          (session.access ACL)
+  Browser ──wss──▶ ubus-wsd ──libubus──▶ ubusd ◀── rpcd (session.access)
+                                            ▲
+                                            │
+                                  uhttpd, mod-ubus, ucode etc.
+                                  (untouched -- separate process)
 ```
 
-- Endpoint: `<c->ubus_prefix>-ws` — derived at plugin init from uhttpd's own `option ubus_prefix` config. For the default `/ubus`, that yields `/ubus-ws`. Sibling of `/ubus`, NOT a child: uhttpd's `path_match()` is a prefix match with `/`-boundary, so `/ubus/ws` would be intercepted by mod-ubus before reaching us. The hyphen breaks the prefix.
-- Companion client: `rpc-ws.js` ships **inside this package** under `files/www/luci-static/resources/rpc-ws.js`, installed to `/www/luci-static/resources/rpc-ws.js` on the device. LuCI views consume it with `'require rpc-ws';`. The client derives its WS URL from `L.env.ubuspath` (the same LuCI config that rpc.js's direct-ubus probe uses), so one config knob configures both transports.
-- Authoritative reference for the JSON-RPC dialect: LuCI's `modules/luci-base/ucode/controller/admin/index.uc` (`action_ubus`).
-
-## Build context
-
-This is a **standalone OpenWrt feed package**. Top-level `Makefile` is the OpenWrt package descriptor; `src/Makefile` is the inner build that produces `uhttpd_ws.so`.
-
-```sh
-# Wire this repo as a feed in your OpenWrt checkout, then:
-echo "src-link mymod $(dirname $PWD)" >> feeds.conf      # or src-git URL
-./scripts/feeds update mymod && ./scripts/feeds install uhttpd-mod-ws
-make menuconfig                                  # select uhttpd-mod-ws with 'm'
-make package/uhttpd-mod-ws/compile V=s
-# IPK lands in bin/packages/<arch>/mymod/
-```
-
-There is no host-side build, no test suite, and no `make check`. Verification is reading + on-device testing.
-
-### How we get uhttpd's plugin headers
-
-uhttpd has no `Build/InstallDev`, and trying to copy them from `$(BUILD_DIR)/uhttpd-*/` at `Build/Prepare` time fails because OpenWrt cleans the source tree after each dependency's install — by the time our package builds, the headers are gone from disk.
-
-The clean OpenWrt-canonical answer (per [jow's forum post](https://forum.openwrt.org/t/custom-packages-exporting-headers-and-linking-custom-packages/105035)) is `Build/InstallDev` in uhttpd's Makefile. We can't add that from outside uhttpd without forking its Makefile or patching the SDK in CI, and the project's GitHub workflow uses a reusable build script across multiple packages where injecting per-package SDK patches would be invasive.
-
-**So we bundle.** `src/uhttpd.h`, `src/plugin.h`, `src/utils.h` are vendored copies from [openwrt/uhttpd@1b624f8f](https://github.com/openwrt/uhttpd/commit/1b624f8f814ed568608d756512892416e0431d77) (master as of 2026-05-17). uhttpd's plugin ABI has been effectively stable since ~2013 — these three files change very rarely.
-
-Three things to keep aligned with upstream uhttpd, watched manually when bumping the vendored copies:
-
-1. **`utils.h`** — pulled in by `uhttpd.h` via a relative `#include "utils.h"`. Only system headers from there, no further uhttpd internals.
-2. **`HAVE_TLS`** — set in `Build/Compile` via `-DHAVE_TLS`. uhttpd in openwrt builds with this flag set, which adds a `struct ustream_ssl ssl` member to `struct client`. Fields we access (`request`, `hdr`, `dispatch`) come AFTER it, so the struct offsets only match if our compile also defines it. (`HAVE_UBUS` and `HAVE_UCODE` add fields only at the *end* of structs we use, so omitting them doesn't shift our offsets and we save a dep.)
-3. **`<libubox/ustream-ssl.h>` header** — pulled in by uhttpd.h when `HAVE_TLS` is defined. We do NOT declare a runtime dep on `libustream-ssl-*` because we don't link or call it; the header is provided transitively by uhttpd's own build chain (uhttpd is compiled with `HAVE_TLS` so it pulls in a libustream variant, whose `Build/InstallDev` stages the header before our compile runs). There is no virtual `libustream-ssl` package — variants do not declare `PROVIDES`.
-
-**Long-term cleanup:** when an upstream PR adds `Build/InstallDev` to openwrt's `package/network/services/uhttpd/Makefile` and lands on a release branch we target, delete the three bundled headers from `src/`, drop `-DHAVE_TLS` (since uhttpd's installed headers will carry the right config), and `-I$(STAGING_DIR)/usr/include/uhttpd` will Just Work.
+- Endpoint: `wss://<host>:<port>/ubus-ws` where `<port>` is from `/etc/config/ubus-ws` (default 8443).
+- Companion JS client: `files/www/luci-static/resources/rpc-ws.js` — installed to `/www/luci-static/resources/` on the device. LuCI views consume it with `'require rpc-ws';`. The client discovers the WS URL at runtime by calling `uci.load('ubus-ws')` over the standard LuCI/uhttpd HTTPS path; the resolved URL is cached for the page lifetime.
+- ACL grant: `files/usr/share/rpcd/acl.d/ubus-wsd.json` grants `read uci.ubus-ws` so the JS client's `uci.load` succeeds for normal logged-in users.
 
 ## Required dependencies (runtime)
 
-- `uhttpd` (host plugin loader)
+- `rpcd` (provides `session.access` for auth + ACL gating)
 - `libubus` (RPC to ubusd)
 - `libubox` (uloop, blobmsg, avl, list)
 - `libblobmsg-json`, `libjson-c` (JSON ↔ blob translation)
-- `libwebsockets` (RFC 6455 framing + handshake). DEPENDS uses the virtual `libwebsockets` name; satisfied by **`libwebsockets-mbedtls`** (PROVIDES `libwebsockets`) or **`libwebsockets-full`** (PROVIDES `libwebsockets`). The standalone `libwebsockets-openssl` variant does NOT provide the virtual name — users wanting an openssl backend should install `libwebsockets-full` instead.
-- *No* runtime dep on `libustream-ssl-*` despite the bundled `uhttpd.h` referencing `<libubox/ustream-ssl.h>` under `HAVE_TLS`. We need the header at **compile time** only — our `.so` never calls a `ustream_ssl_*` function. The header reaches `$(STAGING_DIR)` transitively: `PKG_BUILD_DEPENDS:=uhttpd` builds uhttpd before us; uhttpd compiles with `HAVE_TLS` so its own DEPENDS pulls in whichever libustream-ssl variant the target picked; that variant's `Build/InstallDev` stages the header. There's no virtual `libustream-ssl` package, so `+libustream-ssl` would not resolve — the transitive route is the right answer.
-- `rpcd` (provides the `session` ubus object — auth + ACL gating)
+- `libwebsockets` (RFC 6455 framing, TLS termination, the listening socket)
+- `libuci` (read `/etc/config/ubus-ws` at startup)
+
+## Build context
+
+Standalone OpenWrt feed package. Top-level `Makefile` is the OpenWrt package descriptor; `src/Makefile` is the inner build that produces the `ubus-wsd` binary.
+
+```sh
+# Inside an OpenWrt SDK / buildroot with this repo wired as a feed:
+./scripts/feeds update mymod && ./scripts/feeds install ubus-wsd
+make menuconfig                # select ubus-wsd with 'm'
+make package/ubus-wsd/compile V=s
+# IPK lands in bin/packages/<arch>/mymod/
+```
+
+**No uhttpd source dependency.** Compared to the old plugin version, this build:
+- Has no `PKG_BUILD_DEPENDS:=uhttpd`
+- Doesn't need bundled uhttpd headers (the three `.h` files we used to vendor are gone)
+- Doesn't define `HAVE_TLS` or any uhttpd-struct-layout flag
+- Produces an executable, not a `.so`
 
 ## Critical design constraints
 
@@ -76,67 +57,41 @@ These are not optional. Honor them when modifying code.
 
 Every per-connection `ubus_subscriber` registered with ubusd must be unregistered from `LWS_CALLBACK_CLOSED` via `ws_conn_teardown()`. If you only clean up from the ubusd-side `obj.remove_cb`, the subscriber outlives the client and ubusd's reaper dereferences a freed pointer ~30s later (silent crash, procd respawn).
 
-This is the exact bug shipped in `uhttpd-mod-ubus`'s SSE path (`/ubus/subscribe/<obj>`) as of OpenWrt 25.12. Do not replicate.
-
-(Pre-libwebsockets we wired the teardown to `cl->dispatch.free`. The new path uses libwebsockets's own callback semantics: `LWS_CALLBACK_CLOSED` fires when the wsi is being closed, before per_session_data is freed. `LWS_CALLBACK_WSI_DESTROY` handles the disconnect-before-ESTABLISHED race for any opaque sid we stashed pre-handshake.)
+This is the bug shipped in `uhttpd-mod-ubus`'s SSE path on 25.12. We don't repeat it.
 
 ### 2. Auth — two transports, sid bound at upgrade
 
 - Primary: `Sec-WebSocket-Protocol: ubus-json-rpc-v1, bearer.<sid>` (the only way browser `WebSocket` constructors can pass auth — no header parameter).
 - Fallback: `Authorization: Bearer <sid>` (curl/scripts/tests).
-- Sid is validated once against `rpcd session.access` at upgrade. Per-op ACL is re-checked at dispatch time. Sid binding lives in `struct ws_conn::sid[33]` and is never reset for the life of the connection.
+- Sid is validated once against `rpcd session.access` in `LWS_CALLBACK_FILTER_PROTOCOL_CONNECTION` (BEFORE the handshake response). Per-op ACL is re-checked at dispatch time. Sid binding lives in `struct ws_conn::sid[33]` and is never reset for the life of the connection.
 
 ### 2a. Origin — CSWSH defense in depth
 
-The upgrade handshake also validates the `Origin:` header (same-origin policy: host[:port] portion must match `Host:`). Missing `Origin:` is allowed (non-browser clients don't send it; Bearer still gates). Scheme match (https/wss vs http/ws) is not enforced server-side — browsers refuse mixed-content WS opens, so the path is already closed at the browser. See `ws_origin_ok()`.
+The upgrade handshake also validates the `Origin:` header:
+- Default policy: same-hostname, ports ignored (`router:443` and `router:8443` both count as "router"). This is what makes the typical "LuCI on 443 / daemon on 8443" setup work without extra config.
+- Strict mode: configure `list allowed_origin_host` in `/etc/config/ubus-ws`. When set, that list becomes the only authority — no fallback. Match is by hostname only.
+- Missing Origin: allowed (non-browser clients like curl don't send it; Bearer still gates).
+- See `ws_origin_ok()` + `hostname_from_origin()` + `hostname_from_host()`.
 
-### 3. Coexistence with mod-ubus
+### 3. DoS posture
 
-mod-ws does **not** patch, replace, or override mod-ubus. Both can be installed. Their URL prefixes are disjoint by construction. The `:subscribe` ACL function name is shared semantics — same `session.access` grant unlocks both transports (a feature, not a conflict).
+libwebsockets enforces protocol-level guards (frame size against `rx_buffer_size`, UTF-8 validation, control-frame size rules, fragmentation handling, masking). We add application-level guards as `#define`s at the top of `ws.c`:
 
-### 4. DoS posture
-
-libwebsockets enforces several protocol-level guards automatically (frame size against `rx_buffer_size`, UTF-8 validation, control-frame size rules, malformed frames). We still keep application-level guards as `#define`s at the top of `ws.c`:
-
-- **Per-connection subscription cap**: 64 (configurable). Reject further `subscribe` with JSON-RPC `-32005`.
+- **Per-connection subscription cap**: 64. Reject further `subscribe` with JSON-RPC `-32005`.
 - **Outbound backlog**: 1 MiB queued. On overflow we set `PENDING_TIMEOUT_USER_OK` / `LWS_TO_KILL_ASYNC` to ask libwebsockets to drop the connection cleanly.
 - **Max single inbound frame**: 1 MiB via `rx_buffer_size` on the protocols entry — libwebsockets enforces.
-- **Max JSON nesting depth**: 32. Pre-flight scan (`json_depth_ok`) rejects pathologically nested payloads before json-c's recursive parser ever touches them. Bounds stack consumption regardless of input size.
-- **Liveness**: libwebsockets has built-in PING/PONG bookkeeping; tune via `lws_context_creation_info::ws_ping_pong_interval` if you want stricter than the default.
+- **Max JSON nesting depth**: 32. Pre-flight scan (`json_depth_ok`) rejects pathologically nested payloads before json-c's recursive parser ever touches them.
 
-Adjust the constants for the deployment but do not remove the guards.
+### 4. Async ubus dispatch
 
-### 5. Symbol visibility — uhttpd_plugin MUST be exported
+`ws_dispatch_call` uses `ubus_invoke_async` + `ubus_complete_request_async`, NOT the synchronous `ubus_invoke`. Sync invocation would block the daemon's entire uloop for up to the call's timeout (30s) — every other client, every other connection frozen. Per-connection state tracks in-flight calls (`c->pending_calls`); teardown sets `pending_call->conn = NULL` so completion callbacks drop the reply rather than writing to a freed connection.
 
-We compile with `-fvisibility=hidden` so internal helpers (auth, JSON parsing, callbacks) stay private. uhttpd's plugin loader uses `dlsym(handle, "uhttpd_plugin")` which looks in the .so's dynamic symbol table only — if our `uhttpd_plugin` symbol is hidden, the lookup silently returns NULL and uhttpd skips loading us entirely (no error, no log).
+`ws_acl_check` and `ws_authenticate` still call `ubus_invoke` synchronously, but with 1s timeouts — the blocking is bounded.
 
-The fix is in `ws.c`'s final declaration:
-
-```c
-__attribute__((visibility("default")))
-struct uhttpd_plugin uhttpd_plugin = { .init = ws_plugin_init };
-```
-
-If you ever see "no log lines, .so present but uhttpd doesn't pick it up", check this first:
-
-```sh
-nm -D /usr/lib/uhttpd/uhttpd_ws.so | grep uhttpd_plugin
-# Expect: 0000000000000XXX D uhttpd_plugin
-# If empty, the visibility attribute is missing or has wrong syntax.
-```
-
-### 6. Async ubus dispatch
-
-`ws_dispatch_call` uses `ubus_invoke_async` + `ubus_complete_request_async`, NOT the synchronous `ubus_invoke`. Sync invocation would block uhttpd's entire uloop for up to the call's timeout (30s) — every other client, every other connection frozen. Async dispatch keeps uhttpd responsive while a single slow ubus method runs.
-
-Per-connection state tracks in-flight calls (`c->pending_calls`). When a WS connection tears down with calls still pending, `ws_conn_teardown` sets each `pending_call->conn = NULL`; the call completes naturally in libubus's queue, and `ws_call_complete_cb` notices the NULL and drops the reply rather than writing to a freed connection.
-
-`ws_acl_check` and `ws_authenticate` still call `ubus_invoke` synchronously, but with 1s timeouts — the blocking is bounded and these are not on the hot path of a long-lived stream.
-
-## Wire protocol (Candidate α, mirrors `/ubus`)
+## Wire protocol (mirrors `/ubus` POST JSON-RPC)
 
 ```jsonc
-// Client → server (all have id; replies correlate by id)
+// Client → server
 {"jsonrpc":"2.0","id":1,"method":"call",       "params":[obj, fn, args]}
 {"jsonrpc":"2.0","id":2,"method":"list",       "params":[glob?]}
 {"jsonrpc":"2.0","id":3,"method":"subscribe",  "params":[obj_path]}
@@ -147,47 +102,61 @@ Per-connection state tracks in-flight calls (`c->pending_calls`). When a WS conn
 {"jsonrpc":"2.0",        "method":"notify",    "params":[obj_path, type, data]}
 ```
 
-Server-initiated `notify` has no `id`. Replies always have the same `id` as the request.
+Server-initiated `notify` has no `id`. Replies always carry the same `id` as the request.
 
 ## Project layout
 
 ```
-Makefile        OpenWrt package descriptor. Names the package, declares
-                DEPENDS (incl. the libwebsockets OR-condition), drives
-                src/Makefile via Build/Compile, copies files/ into the
-                IPK at install time.
+Makefile               OpenWrt package descriptor (PKG_NAME, DEPENDS, install/postinst rules)
 src/
-  Makefile      Inner build. Compiles ws.c into uhttpd_ws.so, links
-                libubus + libubox + libblobmsg-json + libjson-c +
-                libwebsockets. CC/CFLAGS/LDFLAGS injected by outer
-                Makefile.
-  ws.c          Main implementation. Auth + Origin + ubus glue is ours;
-                RFC 6455 framing/handshake is libwebsockets. Headers
-                explain each section.
-files/          Tree copied verbatim into the IPK at install time.
-                Mirrors device paths -- files/www/... -> /www/... etc.
+  Makefile             Inner build (ws.o + main.o -> ubus-wsd binary, links the libs)
+  ws.h                 Public interface: struct ws_config, ws_init, ws_shutdown
+  ws.c                 Daemon implementation: lws callbacks, auth, ACL, async ubus
+                       dispatch, subscriber lifecycle, JSON-RPC parsing
+  main.c               Process bootstrap: getopt, UCI config load, signals,
+                       uloop_init/run, ws_init/ws_shutdown
+files/                 Tree copied verbatim into the IPK at install time
+  etc/
+    config/ubus-ws     Default UCI config (port 8443, cert/key paths,
+                       optional allowed_origin_host allowlist)
+    init.d/ubus-ws     procd-managed service definition
+  usr/share/rpcd/acl.d/
+    ubus-wsd.json      Grants read access to uci.ubus-ws for the JS client
   www/luci-static/resources/
-    rpc-ws.js   LuCI client wrapper. Promise-based call/list +
-                callback-based subscribe; multiplexed over one WS;
-                reads L.env.ubuspath for the WS URL.
-CLAUDE.md       This file.
+    rpc-ws.js          LuCI client wrapper. Promise-based call/list +
+                       callback-based subscribe; multiplexed over one WS;
+                       reads daemon port via uci.load('ubus-ws')
+CLAUDE.md              This file.
+LICENSE                Apache-2.0.
 ```
 
-## Open verification items
+## UCI config schema (`/etc/config/ubus-ws`)
 
-Mechanical to resolve once a build is running on a device:
+```
+config server 'main'
+    option port               '8443'             # TLS listen port
+    option cert               '/etc/uhttpd.crt'  # PEM cert (shared with uhttpd by default)
+    option key                '/etc/uhttpd.key'  # PEM private key
+    option ubus_socket        '/var/run/...'     # optional override; unset = libubus default
+    list   allowed_origin_host 'router.lan'      # optional; when set, becomes strict allowlist
+```
 
-1. **libwebsockets ↔ uloop integration**: `ws_lws_init()` creates the context with `LWS_SERVER_OPTION_VALIDATE_UTF8 | LWS_SERVER_OPTION_DISABLE_IPV6_LISTEN`. With `LWS_WITH_ULOOP=ON` in the OpenWrt build, lws *should* use uhttpd's existing uloop automatically, but if there's a flag to opt in (`LWS_SERVER_OPTION_ULOOP` or via `foreign_loops`), add it. Verify by watching whether wsi callbacks fire — if they don't, lws isn't seeing uloop events.
-2. **`cl->request.url` field name**: `ws_rebuild_request()` reads it to construct the request line for `lws_adopt_socket_readbuf`. May actually be `cl->request.uri` or similar in some uhttpd versions. The plugin won't accept WS upgrades if this is wrong; check the uhttpd plugin.h.
-3. **`cl->fd.fd` and `ops->client_close()` semantics**: we `dup()` the fd before adopt and `ops->client_close(cl)` afterwards. Verify uhttpd doesn't double-close or try to read after.
-4. **Session id re-lookup**: `session_obj_id` is cached at plugin init; if rpcd isn't up yet at uhttpd startup it's logged-but-not-fatal. Add a retry on first authenticate if you see "session not found" errors.
+## procd init (`/etc/init.d/ubus-ws`)
+
+Standard procd template. `procd_add_reload_trigger 'ubus-ws'` means `uci commit ubus-ws` + `/etc/init.d/ubus-ws reload` picks up config changes without a restart cycle for adjacent services.
+
+## Operational notes
+
+- `logread -e ubus-wsd` shows the startup banner ("listening on :8443") and per-connection auth-reject reasons.
+- `ubus list` should show no entries from us — we're a CLIENT of ubus, not a publisher.
+- The package's `postinst` does `/etc/init.d/rpcd reload` to make rpcd pick up our new ACL file, then enables + starts the daemon. `prerm` stops and disables.
 
 ## What this repo does NOT contain
 
-- A reference producer daemon (`publish()` + `subscribe_cb` lifecycle) — that pattern is per-app and lives wherever the consuming app lives. See `applications/luci-app-example/` in openwrt/luci for a small reference.
-- A hard `luci-base` dependency — the package installs `rpc-ws.js` into `/www/luci-static/resources/` regardless. Harmless when LuCI isn't installed; immediately useful when it is. If you want to force LuCI as a prerequisite, add `+luci-base` to `DEPENDS`.
+- A reference producer daemon — that pattern is per-app and lives wherever the consuming app lives.
+- Any uhttpd code, headers, or build artifacts. The earlier vendored `uhttpd.h`/`plugin.h`/`utils.h` are gone.
 
 ## Commit conventions
 
-- Subject prefix: short, lowercase after prefix (matches OpenWrt feed convention).
-- Real-name `Signed-off-by:` required for upstream merge paths (CI checks this on openwrt/* repos).
+- Short, descriptive subject line; component prefix optional but welcome (e.g., `ws.c:`, `main.c:`).
+- Real-name `Signed-off-by:` required for upstream merge paths.
