@@ -37,11 +37,11 @@ jobs:
     permissions: {}
     uses: Zerogiven/gh-openwrt-package-build-workflows/.github/workflows/reusable-build.yml@main
     with:
-      package_name: 'uhttpd-mod-ws'
-      sdk_packages: 'uhttpd-mod-ws'
+      package_name: 'ubus-wsd'
+      sdk_packages: 'ubus-wsd'
       artifacts_patterns: |
-        uhttpd-mod-ws*.ipk
-        uhttpd-mod-ws*.apk
+        ubus-wsd*.ipk
+        ubus-wsd*.apk
       openwrt_version: ${{ matrix.openwrt_version }}
       openwrt_build_version: ${{ matrix.openwrt_build_version }}
       arch: ${{ matrix.arch }}

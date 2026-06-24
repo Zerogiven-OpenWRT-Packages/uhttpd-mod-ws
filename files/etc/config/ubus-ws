@@ -1,0 +1,29 @@
+# ubus-wsd configuration. See /usr/share/doc/ubus-wsd or the project README
+# for details on each option.
+#
+# After editing this file:  /etc/init.d/ubus-ws restart
+
+config server 'main'
+	# TLS listen port. The daemon ALWAYS terminates TLS (wss://) -- there
+	# is no plaintext mode. Defaults to 8443 if missing or invalid.
+	option port '8443'
+
+	# Server cert + private key. Defaults match uhttpd's default paths so
+	# the daemon can share them out of the box; point elsewhere if you
+	# want a separate cert for this endpoint.
+	option cert '/etc/uhttpd.crt'
+	option key  '/etc/uhttpd.key'
+
+	# Optional override of the ubus socket path. Leave unset to use the
+	# libubus default (/var/run/ubus/ubus.sock).
+	#option ubus_socket '/var/run/ubus/ubus.sock'
+
+	# Origin allowlist. If unset (the default), the daemon allows any
+	# Origin whose hostname matches the Host header (ports may differ --
+	# this is what makes the typical "LuCI on :443 / daemon on :8443"
+	# setup work without further config). To lock down to specific
+	# origins, add explicit entries here -- it then becomes the only
+	# allowed list. Match is by hostname only; ports are ignored.
+	#
+	#list allowed_origin_host 'router.lan'
+	#list allowed_origin_host 'admin.example.com'

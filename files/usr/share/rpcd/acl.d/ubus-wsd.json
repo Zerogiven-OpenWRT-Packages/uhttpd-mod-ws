@@ -1,0 +1,8 @@
+{
+	"ubus-wsd": {
+		"description": "Allow reading the ubus-wsd daemon UCI config so the LuCI client (rpc-ws.js) can discover the WebSocket port at runtime",
+		"read": {
+			"uci": [ "ubus-ws" ]
+		}
+	}
+}

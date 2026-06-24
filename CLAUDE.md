@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working in this
 
 `ubus-wsd` is a **standalone daemon** that exposes ubus JSON-RPC over a WebSocket endpoint. It listens on its own TLS port (default 8443), authenticates against rpcd's session.access just like uhttpd-mod-ubus does, and dispatches `call`, `list`, `subscribe`, and `unsubscribe` verbs to ubus.
 
-It is NOT a uhttpd plugin. The earlier version of this project tried to be one (`uhttpd-mod-ws.so`), but uhttpd's plugin loader has a **hardcoded list** of plugins it will load (mod-ubus / mod-lua / mod-ucode) — there is no mechanism for third-party plugins to register. That architectural dead-end is why we became a standalone daemon. (Local-patched uhttpd was an option, but would have meant every consumer of our package needed to also ship a forked uhttpd build.)
+It is NOT a uhttpd plugin. The earlier version of this project tried to be one (`ubus-wsd.so`), but uhttpd's plugin loader has a **hardcoded list** of plugins it will load (mod-ubus / mod-lua / mod-ucode) — there is no mechanism for third-party plugins to register. That architectural dead-end is why we became a standalone daemon. (Local-patched uhttpd was an option, but would have meant every consumer of our package needed to also ship a forked uhttpd build.)
 
 ## Where it fits
 
