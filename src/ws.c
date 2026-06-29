@@ -171,7 +171,7 @@ static void  ws_conn_teardown(struct ws_conn *c);
  * missing or wouldn't fit in `buflen`. The result is always NUL-terminated
  * on success.
  *
- * Tokens commonly used: WSI_TOKEN_HOST, WSI_TOKEN_HTTP_ORIGIN,
+ * Tokens commonly used: WSI_TOKEN_HOST, WSI_TOKEN_ORIGIN,
  * WSI_TOKEN_HTTP_AUTHORIZATION, WSI_TOKEN_PROTOCOL (Sec-WebSocket-Protocol).
  */
 static int
@@ -433,7 +433,7 @@ ws_origin_ok(struct lws *wsi)
 
     /* Origin absent: allow. Non-browser clients (curl, scripts) don't send
      * it; Bearer auth still gates access. */
-    if (get_hdr(wsi, WSI_TOKEN_HTTP_ORIGIN, origin_buf, sizeof(origin_buf)) <= 0)
+    if (get_hdr(wsi, WSI_TOKEN_ORIGIN, origin_buf, sizeof(origin_buf)) <= 0)
         return true;
 
     if (!hostname_from_origin(origin_buf, origin_host, sizeof(origin_host)))
